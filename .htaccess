@@ -1,0 +1,11 @@
+# وقتی Document Root را نمی‌شود روی public گذاشت: همه‌ی درخواست‌ها به public/ می‌روند
+# و فایل‌های پروژه (.env، storage، vendor …) از بیرون در دسترس نیستند.
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^(\.env|\.git|storage|vendor|app|config|database|bootstrap|routes|resources|tests|lang|artisan|composer\.(json|lock))(/|$) - [F,L,NC]
+    RewriteCond %{REQUEST_URI} !^/public/
+    RewriteRule ^(.*)$ public/$1 [L]
+</IfModule>
+<FilesMatch "^\.">
+    Require all denied
+</FilesMatch>
