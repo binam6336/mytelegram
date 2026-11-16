@@ -10,6 +10,9 @@ if (file_exists($maintenance = __DIR__.'/../storage/framework/maintenance.php'))
     require $maintenance;
 }
 
+// پیش‌بررسی نصب: به‌جای خطای ۵۰۰ بی‌توضیح، علت را به فارسی نشان می‌دهد.
+require __DIR__.'/../bootstrap/preflight.php';
+
 // Register the Composer autoloader...
 require __DIR__.'/../vendor/autoload.php';
 
