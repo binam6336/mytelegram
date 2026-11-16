@@ -10,11 +10,20 @@ $root = dirname(__DIR__);
 $problems = array();
 
 if (version_compare(PHP_VERSION, '8.2.0', '<')) {
-    $problems[] = array(
-        'نسخه‌ی PHP که همین صفحه با آن اجرا شده '.PHP_VERSION.' است ('.PHP_SAPI.')',
-        'اگر در پنل هاست نسخه‌ی بالاتری انتخاب کرده‌اید، این پوشه یا دامنه هنوز نسخه‌ی دیگری می‌گیرد: نسخه را برای همین دامنه/ساب‌دامین در MultiPHP Manager تنظیم کنید و خط‌های AddHandler/SetHandler قدیمی (مثلاً ea-php74) را از فایل‌های .htaccess پوشه‌ی بالاتر پاک کنید. '
-            .'این برنامه PHP نسخه‌ی 8.2 یا بالاتر می‌خواهد. در cPanel از «Select PHP Version» یا «MultiPHP Manager» نسخه‌ی 8.2 یا 8.3 را برای این دامنه انتخاب کنید.',
-    );
+    $host = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : '';
+    $docRoot = isset($_SERVER['DOCUMENT_ROOT']) ? $_SERVER['DOCUMENT_ROOT'] : '';
+    $hint = 'این برنامه PHP 8.2 یا بالاتر می‌خواهد، ولی همین صفحه واقعاً با PHP '.PHP_VERSION.' اجرا شده؛ یعنی نسخه‌ای که در پنل انتخاب کرده‌اید روی این دامنه اعمال نشده. ';
+    if (PHP_SAPI === 'fpm-fcgi') {
+        // PHP-FPM فعال است: در cPanel نسخه فقط از MultiPHP Manager خوانده می‌شود و «Select PHP Version» (CloudLinux) نادیده گرفته می‌شود.
+        $hint .= 'این دامنه با PHP-FPM اجرا می‌شود؛ در این حالت تنظیم «Select PHP Version» اثری ندارد. '
+            .'در cPanel به MultiPHP Manager بروید، تیک دامنه‌ی «'.$host.'» را بزنید، از فهرست سمت راست ea-php83 (یا 8.2) را انتخاب و Apply کنید. '
+            .'اگر می‌خواهید از همان «Select PHP Version» استفاده کنید، باید PHP-FPM این دامنه را در MultiPHP Manager خاموش کنید. ';
+    } else {
+        $hint .= 'در cPanel، MultiPHP Manager را برای دامنه‌ی «'.$host.'» روی ea-php83 بگذارید (یا اگر «Select PHP Version» دارید، آن‌جا 8.3 را انتخاب کنید). ';
+    }
+    $hint .= 'اگر پروژه در یک زیرپوشه است، فایل .htaccess پوشه‌های بالاتر (مثلاً public_html) را باز کنید و بلوک «cPanel-generated handler» که ea-php74 یا alt-php74 دارد را به 83 تغییر دهید یا حذف کنید.'
+        .($docRoot ? ' (ریشه‌ی این دامنه: '.$docRoot.')' : '');
+    $problems[] = array('نسخه‌ی PHP این دامنه '.PHP_VERSION.' است ('.PHP_SAPI.')', $hint);
 }
 
 foreach (array('pdo_mysql', 'mbstring', 'openssl', 'fileinfo', 'xml', 'dom', 'ctype', 'tokenizer') as $ext) {
@@ -72,4 +81,4 @@ if ($problems) {
     exit;
 }
 
-unset($root, $problems, $envFile, $env, $dir, $path, $ext);
+unset($root, $problems, $envFile, $env, $dir, $path, $ext, $host, $docRoot, $hint);
