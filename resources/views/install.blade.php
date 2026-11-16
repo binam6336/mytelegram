@@ -23,6 +23,14 @@
                 به‌جای <code>php</code> مسیر کامل بالا را بنویسید، یا جدول‌ها را با دکمه‌ی همین صفحه بسازید.</li>
         @endif
 
+        @if ($proxies)
+            <li class="good"><b>پروکسی تلگرام:</b> <span dir="ltr">{{ implode('، ', $proxies) }}</span></li>
+        @elseif ($proxy_raw)
+            <li class="bad"><b>TELEGRAM_PROXY قابل خواندن نیست.</b> قالب درست: <code dir="ltr">tg://proxy?server=…&amp;port=…&amp;secret=…</code> یا <code dir="ltr">socks5://host:port</code></li>
+        @else
+            <li class="warn"><b>پروکسی تلگرام تنظیم نشده.</b> اگر هاست در ایران است، <code>TELEGRAM_PROXY</code> را در <code>.env</code> پر کنید.</li>
+        @endif
+
         @if ($db_ok)
             <li class="good"><b>اتصال دیتابیس:</b> برقرار است.</li>
         @else

@@ -32,6 +32,9 @@ interface TelegramGateway
      */
     public function fetchNew(TelegramAccount $account, array $cursors, int $since, ?int $lastSync, float $budget): array;
 
+    /** بررسی اتصال به سرور تلگرام؛ خروجی: ['authorized' => bool, 'ms' => int] */
+    public function ping(TelegramAccount $account): array;
+
     /** خروج از حساب تلگرام و حذف نشست */
     public function logout(TelegramAccount $account): void;
 }

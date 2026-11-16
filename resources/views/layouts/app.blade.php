@@ -19,6 +19,12 @@
             @include('partials.logo')
             <span>تله‌پنل<small>مدیریت پیام تلگرام</small></span>
         </a>
+        @php($conn = \App\Http\Controllers\TelegramController::pingView($acc ? \Illuminate\Support\Facades\Cache::get(\App\Services\Telegram\TelegramService::pingKey($acc->id)) : null, $acc))
+        {{-- چراغ اتصال به تلگرام؛ با AJAX هر دقیقه به‌روز می‌شود، کلیک = بررسی دوباره --}}
+        <button type="button" class="conn is-{{ $conn['state'] }}" data-conn data-url="{{ route('telegram.ping') }}"
+                title="{{ $conn['title'] }}" aria-live="polite">
+            <i class="lamp" aria-hidden="true"></i><span data-conn-label>{{ $conn['label'] }}</span>
+        </button>
         <nav class="nav">
             <a href="{{ route('dashboard') }}" @class(['on' => request()->routeIs('dashboard')])>
                 <svg viewBox="0 0 24 24"><path d="M3 12l9-8 9 8M5 10v10h5v-6h4v6h5V10"/></svg>داشبورد</a>

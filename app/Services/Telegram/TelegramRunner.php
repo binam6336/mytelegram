@@ -21,7 +21,7 @@ class TelegramRunner
 
     public function __construct(private TelegramService $service) {}
 
-    public function call(TelegramAccount $account, string $action, array $payload = []): array
+    public function call(TelegramAccount $account, string $action, array $payload = [], ?float $timeout = null): array
     {
         // بدون proc_open، یا وقتی php-cli هم‌نسخه‌ی وب پیدا نشد (مثلاً php خط فرمان 7.4 است)،
         // همان‌جا داخل درخواست وب اجرا می‌شود (باز هم کوتاه و بدون اتصال ماندگار).
@@ -37,12 +37,14 @@ class TelegramRunner
             base_path(),
             null,
             json_encode($payload, JSON_UNESCAPED_UNICODE),
-            (float) config('telegram.process_timeout', 60),
+            $timeout ?? (float) config('telegram.process_timeout', 60),
         );
         @set_time_limit((int) config('telegram.process_timeout', 60) + 15);
 
         try {
             $process->run();
+        } catch (\Symfony\Component\Process\Exception\ProcessTimedOutException) {
+            return ['ok' => false, 'timeout' => true, 'message' => 'پاسخی از تلگرام نرسید (زمان تمام شد). اگر هاست در ایران است پروکسی TELEGRAM_PROXY را بررسی کنید.'];
         } catch (Throwable $e) {
             Log::warning('telegram process failed', ['error' => $e->getMessage()]);
 

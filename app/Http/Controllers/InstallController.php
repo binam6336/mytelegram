@@ -69,6 +69,8 @@ class InstallController extends Controller
             'cli_version' => $cli ? PhpBinary::version($cli) : null,
             'plain_version' => $plain,
             'proc_open' => function_exists('proc_open'),
+            'proxies' => array_column(\App\Support\TelegramProxy::all(), 'label'),
+            'proxy_raw' => trim((string) config('telegram.proxy')) !== '',
             'db_ok' => $dbOk,
             'db_error' => $dbError,
             'pending' => $pending,

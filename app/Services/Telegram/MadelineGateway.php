@@ -3,6 +3,7 @@
 namespace App\Services\Telegram;
 
 use App\Models\TelegramAccount;
+use App\Support\TelegramProxy;
 use danog\MadelineProto\API;
 use danog\MadelineProto\Logger;
 use danog\MadelineProto\Settings;
@@ -140,6 +141,18 @@ class MadelineGateway implements TelegramGateway
         }
 
         return ['messages' => $messages, 'cursors' => $cursors, 'complete' => $complete];
+    }
+
+    public function ping(TelegramAccount $account): array
+    {
+        $t = microtime(true);
+        $api = $this->api($account);
+        $api->help->getNearestDc();  // یک درخواست سبک: اتصال واقعی به سرور تلگرام (از راه پروکسی اگر تنظیم شده)
+
+        return [
+            'authorized' => $api->getAuthorization() === API::LOGGED_IN,
+            'ms' => (int) round((microtime(true) - $t) * 1000),
+        ];
     }
 
     public function logout(TelegramAccount $account): void
@@ -363,6 +376,15 @@ class MadelineGateway implements TelegramGateway
             ->setExtra(storage_path('logs/madeline.log'))
             ->setLevel(Logger::LEVEL_ERROR)
             ->setMaxSize(5 * 1024 * 1024);
+
+        // پروکسی (هاست‌های داخل ایران) و سقف زمان هر تلاش اتصال
+        $proxies = [];
+        foreach (TelegramProxy::all() as $p) {
+            $proxies[$p['class']][] = $p['extra'];
+        }
+        $settings->getConnection()
+            ->setProxies($proxies)
+            ->setTimeout((float) config('telegram.connect_timeout', 10));
 
         return $this->apis[$account->id] = new API($account->sessionPath(), $settings);
     }

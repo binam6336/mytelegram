@@ -20,6 +20,11 @@ class TelegramService
 {
     public function __construct(private TelegramGateway $gateway, private KeywordFilter $filter) {}
 
+    public static function pingKey(int $accountId): string
+    {
+        return 'tg-ping-state-'.$accountId;
+    }
+
     public function run(TelegramAccount $account, string $action, array $payload = []): array
     {
         // روی هر حساب در هر لحظه فقط یک پردازش با فایل نشست کار می‌کند
@@ -34,6 +39,7 @@ class TelegramService
                 'verify-password' => $this->verifyPassword($account, (string) ($payload['password'] ?? '')),
                 'sync' => $this->sync($account, (float) ($payload['budget'] ?? config('telegram.sync_budget', 20))),
                 'logout' => $this->logout($account),
+                'ping' => ['ok' => true, 'message' => 'اتصال برقرار است.'] + $this->gateway->ping($account),
                 default => ['ok' => false, 'message' => 'عملیات ناشناخته'],
             };
         } catch (Throwable $e) {
@@ -148,6 +154,9 @@ class TelegramService
                     );
                 }
             }
+
+            // دور موفق یعنی اتصال برقرار است (چراغ سایدبار)
+            Cache::put(self::pingKey($account->id), ['state' => 'ok', 'authorized' => true, 'ms' => null, 'at' => time()], 86400);
 
             $account->update([
                 'last_synced_at' => $now,

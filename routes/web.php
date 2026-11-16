@@ -28,6 +28,7 @@ Route::middleware('auth')->group(function () {
     Route::prefix('telegram')->name('telegram.')->controller(TelegramController::class)->group(function () {
         Route::get('/', 'show')->name('connect');
         Route::get('/status', 'status')->name('status');
+        Route::get('/ping', 'ping')->middleware('throttle:30,1')->name('ping');
         Route::post('/credentials', 'credentials')->name('credentials');
         Route::post('/code', 'sendCode')->name('code');
         Route::post('/verify', 'verifyCode')->name('verify');

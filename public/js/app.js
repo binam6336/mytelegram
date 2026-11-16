@@ -224,6 +224,43 @@
         go(step);
     }
 
+    // ---------- چراغ اتصال به تلگرام (سایدبار) ----------
+    (function () {
+        const btn = $('[data-conn]');
+        if (!btn) return;
+        let timer = null;
+        let busy = false;
+        function show(r) {
+            btn.className = 'conn is-' + (r.state || 'none');
+            $('[data-conn-label]', btn).textContent = r.label || '';
+            btn.title = r.title || '';
+        }
+        async function check(force) {
+            if (busy) return;
+            if (!force && document.hidden) { clearTimeout(timer); return; } // در تب پنهان بررسی نمی‌کنیم
+            busy = true;
+            if (force) show({ state: 'checking', label: 'بررسی اتصال…', title: btn.title });
+            try {
+                const res = await fetch(btn.dataset.url + (force ? '?force=1' : ''), { headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' }, credentials: 'same-origin' });
+                if (res.ok) {
+                    const r = await res.json();
+                    show(r);
+                    if (r.state === 'none') return; // بدون کلید، بررسی دوره‌ای لازم نیست
+                    // اگر بررسی دیگری در جریان بود کمی بعد دوباره بپرس
+                    clearTimeout(timer);
+                    timer = setTimeout(() => check(false), r.checking || r.state === 'checking' ? 5000 : 60000);
+                    return;
+                }
+            } catch (e) { /* شبکه‌ی مرورگر قطع است؛ دور بعد */ }
+            finally { busy = false; }
+            clearTimeout(timer);
+            timer = setTimeout(() => check(false), 60000);
+        }
+        btn.addEventListener('click', () => check(true));
+        document.addEventListener('visibilitychange', () => { if (!document.hidden) check(false); });
+        check(false);
+    })();
+
     bindPower(document);
     $$('[data-wizard]').forEach(wizard);
 })();

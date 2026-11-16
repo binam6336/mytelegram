@@ -255,6 +255,20 @@ dialog.dlg label { display: flex; flex-direction: column; gap: 6px; margin: 12px
     .fl-meta { padding-inline-start: 4px; }
 }
 
+/* ---------- چراغ اتصال سایدبار ---------- */
+.conn { display: flex; align-items: center; gap: 9px; margin: -10px 8px 16px; padding: 6px 12px; border: 0; border-radius: 99px;
+    background: rgba(0,0,0,.16); color: rgba(255,255,255,.92); font: inherit; font-size: 12.5px; cursor: pointer; text-align: start; }
+.conn:hover { background: rgba(0,0,0,.24); }
+.conn span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lamp { width: 10px; height: 10px; flex: none; border-radius: 50%; background: #94A3B8; position: relative; }
+.conn.is-ok .lamp { background: #4ADE80; box-shadow: 0 0 4px 1px #4ADE80, 0 0 12px 3px rgba(74,222,128,.75); animation: glowG 2.2s ease-in-out infinite; }
+.conn.is-down .lamp { background: #F87171; box-shadow: 0 0 4px 1px #F87171, 0 0 12px 3px rgba(248,113,113,.8); animation: glowR 1.1s ease-in-out infinite; }
+.conn.is-checking .lamp { background: #FCD34D; box-shadow: 0 0 8px 2px rgba(252,211,77,.6); animation: blink .8s ease-in-out infinite; }
+@keyframes glowG { 50% { box-shadow: 0 0 2px 0 #4ADE80, 0 0 6px 1px rgba(74,222,128,.4); } }
+@keyframes glowR { 50% { box-shadow: 0 0 2px 0 #F87171, 0 0 5px 1px rgba(248,113,113,.35); opacity: .75; } }
+@keyframes blink { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .lamp { animation: none !important; } }
+
 /* ---------- install ---------- */
 .checks { list-style: none; padding: 0; margin: 16px 0; display: grid; gap: 8px; }
 .checks li { padding: 10px 14px; border-radius: 12px; font-size: 14px; border-inline-start: 4px solid; }

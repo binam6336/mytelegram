@@ -4,6 +4,10 @@ namespace App\Http\Controllers;
 
 use App\Models\TelegramAccount;
 use App\Services\Telegram\TelegramRunner;
+use App\Services\Telegram\TelegramService;
+use App\Support\TelegramProxy;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\RateLimiter;
@@ -141,6 +145,70 @@ class TelegramController extends Controller
         $account = $request->user()->telegramAccount;
 
         return response()->json($account ? $this->state($account) : ['connected' => false]);
+    }
+
+    /**
+     * چراغ اتصال سایدبار: نتیجه‌ی آخرین بررسی از کش؛ هر TELEGRAM_PING_CACHE ثانیه یک بار
+     * واقعاً (در یک اجرای کوتاه) به سرور تلگرام وصل می‌شود. force=1 بررسی دوباره (حداقل هر ۱۰ ثانیه).
+     */
+    public function ping(Request $request): JsonResponse
+    {
+        $account = $request->user()->telegramAccount;
+        if (! $account) {
+            return response()->json(self::pingView(null, null));
+        }
+        $key = TelegramService::pingKey($account->id);
+        $cached = Cache::get($key);
+        $age = $cached ? time() - (int) $cached['at'] : PHP_INT_MAX;
+        $ttl = $request->boolean('force') ? 10 : (int) config('telegram.ping_cache', 60);
+        if ($age < $ttl) {
+            return response()->json(self::pingView($cached, $account));
+        }
+        $lock = Cache::lock('tg-ping-'.$account->id, (int) config('telegram.ping_timeout', 25) + 10);
+        if (! $lock->get()) {
+            return response()->json(self::pingView($cached, $account) + ['checking' => true]);
+        }
+        try {
+            $res = $this->runner->call($account, 'ping', [], (float) config('telegram.ping_timeout', 25));
+        } finally {
+            $lock->release();
+        }
+        if (! empty($res['busy'])) {
+            // همگام‌سازی در حال اجراست؛ یعنی همین حالا به تلگرام وصل است یا نتیجه‌اش به‌زودی ثبت می‌شود
+            return response()->json(self::pingView($cached, $account) + ['checking' => true]);
+        }
+        $state = ($res['ok'] ?? false)
+            ? ['state' => 'ok', 'authorized' => (bool) ($res['authorized'] ?? false), 'ms' => $res['ms'] ?? null]
+            : ['state' => 'down', 'message' => $res['message'] ?? 'خطا'];
+        $state['at'] = time();
+        Cache::put($key, $state, 86400);
+
+        return response()->json(self::pingView($state, $account));
+    }
+
+    /** متن و وضعیت چراغ (برای JSON و رندر اولیه‌ی سایدبار) */
+    public static function pingView(?array $s, ?TelegramAccount $account): array
+    {
+        $proxy = count(TelegramProxy::all());
+        $via = $proxy ? ' (از راه پروکسی)' : '';
+        if (! $account) {
+            return ['state' => 'none', 'label' => 'تلگرام وصل نشده', 'title' => 'اول کلیدهای اتصال را در صفحه‌ی «اتصال تلگرام» ثبت کنید.'];
+        }
+        if (! $s) {
+            return ['state' => 'checking', 'label' => 'بررسی اتصال…', 'title' => 'در حال بررسی اتصال به تلگرام'.$via];
+        }
+        $ago = 'آخرین بررسی: '.Carbon::createFromTimestamp($s['at'], config('app.timezone'))->diffForHumans();
+        if ($s['state'] === 'ok') {
+            $ms = ! empty($s['ms']) ? ' · '.$s['ms'].'ms' : '';
+
+            return [
+                'state' => 'ok',
+                'label' => 'تلگرام متصل'.$ms,
+                'title' => ($s['authorized'] ? 'اتصال به سرور تلگرام برقرار است' : 'سرور تلگرام در دسترس است؛ هنوز وارد حساب نشده‌اید').$via.' — '.$ago,
+            ];
+        }
+
+        return ['state' => 'down', 'label' => 'تلگرام قطع', 'title' => ($s['message'] ?? 'اتصال برقرار نشد').$via.' — '.$ago];
     }
 
     /** خروج از حساب تلگرام (کلیدها می‌مانند) */

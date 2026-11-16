@@ -9,6 +9,19 @@ return [
     */
     'mode' => env('TELEGRAM_MODE', 'process'),
 
+    /*
+    | پروکسی اتصال به تلگرام (برای هاست داخل ایران). یک یا چند مورد با ویرگول:
+    |  tg://proxy?server=…&port=…&secret=…   |  socks5://user:pass@host:port  |  http://host:port
+    */
+    'proxy' => env('TELEGRAM_PROXY', ''),
+
+    // سقف زمان هر تلاش اتصال به سرور/پروکسی (ثانیه)
+    'connect_timeout' => (int) env('TELEGRAM_CONNECT_TIMEOUT', 10),
+
+    // بررسی وضعیت اتصال برای چراغ سایدبار: هر چند ثانیه یک بار واقعاً بررسی شود (بقیه از کش)
+    'ping_cache' => (int) env('TELEGRAM_PING_CACHE', 60),
+    'ping_timeout' => (int) env('TELEGRAM_PING_TIMEOUT', 25),
+
     // فقط برای توسعه/تست: درگاه آزمایشی بدون تلگرام واقعی (کد 12345)
     'fake' => (bool) env('TELEGRAM_FAKE', false),
 

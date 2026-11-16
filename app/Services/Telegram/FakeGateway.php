@@ -84,5 +84,12 @@ class FakeGateway implements TelegramGateway
         return ['messages' => $messages, 'cursors' => $cursors, 'complete' => true];
     }
 
+    public function ping(TelegramAccount $account): array
+    {
+        usleep(150_000);
+
+        return ['authorized' => $account->isAuthorized(), 'ms' => random_int(80, 260)];
+    }
+
     public function logout(TelegramAccount $account): void {}
 }
