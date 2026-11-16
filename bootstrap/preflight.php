@@ -9,10 +9,10 @@
 $root = dirname(__DIR__);
 $problems = array();
 
-if (version_compare(PHP_VERSION, '8.3.0', '<')) {
+if (version_compare(PHP_VERSION, '8.2.0', '<')) {
     $problems[] = array(
         'نسخه‌ی PHP قدیمی است: '.PHP_VERSION,
-        'این برنامه PHP نسخه‌ی 8.3 یا بالاتر می‌خواهد. در cPanel از «Select PHP Version» یا «MultiPHP Manager» نسخه‌ی 8.3 را برای این دامنه انتخاب کنید.',
+        'این برنامه PHP نسخه‌ی 8.2 یا بالاتر می‌خواهد. در cPanel از «Select PHP Version» یا «MultiPHP Manager» نسخه‌ی 8.2 یا 8.3 را برای این دامنه انتخاب کنید.',
     );
 }
 

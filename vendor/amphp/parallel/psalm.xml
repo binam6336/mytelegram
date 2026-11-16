@@ -1,0 +1,70 @@
+<?xml version="1.0"?>
+<psalm
+        errorLevel="2"
+        phpVersion="8.1"
+        resolveFromConfigFile="true"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xmlns="https://getpsalm.org/schema/config"
+        xsi:schemaLocation="https://getpsalm.org/schema/config vendor/vimeo/psalm/config.xsd"
+>
+    <projectFiles>
+        <directory name="examples"/>
+        <directory name="src"/>
+        <ignoreFiles>
+            <directory name="vendor"/>
+        </ignoreFiles>
+    </projectFiles>
+
+    <issueHandlers>
+        <StringIncrement>
+            <errorLevel type="suppress">
+                <file name="src/Worker/Internal/TaskSubmission.php"/>
+            </errorLevel>
+        </StringIncrement>
+
+        <ClassMustBeFinal>
+            <errorLevel type="suppress">
+                <file name="src/Worker/WorkerException.php"/>
+                <file name="src/Context/ContextException.php"/>
+                <file name="src/Context/StatusError.php"/>
+            </errorLevel>
+        </ClassMustBeFinal>
+
+        <DocblockTypeContradiction>
+            <errorLevel type="suppress">
+                <directory name="src"/>
+            </errorLevel>
+        </DocblockTypeContradiction>
+
+        <UnusedClass>
+            <errorLevel type="suppress">
+                <directory name="src"/>
+            </errorLevel>
+        </UnusedClass>
+
+        <PossiblyUnusedMethod>
+            <errorLevel type="suppress">
+                <directory name="src"/>
+            </errorLevel>
+        </PossiblyUnusedMethod>
+
+        <UnusedVariable>
+            <errorLevel type="suppress">
+                <directory name="examples"/>
+                <directory name="src"/>
+            </errorLevel>
+        </UnusedVariable>
+
+        <UndefinedClass>
+            <errorLevel type="suppress">
+                <directory name="src"/>
+            </errorLevel>
+        </UndefinedClass>
+
+        <UnsupportedPropertyReferenceUsage>
+            <errorLevel type="suppress">
+                <directory name="src"/>
+            </errorLevel>
+        </UnsupportedPropertyReferenceUsage>
+    </issueHandlers>
+</psalm>

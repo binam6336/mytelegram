@@ -1,0 +1,67 @@
+{
+    "name": "danog/php-rtc-srtp",
+    "type": "library",
+    "description": "Pure-PHP SRTP and SRTCP encryption using phpseclib, with AES-CM and AES-GCM profiles. MadelineProto's PHP 8.2+ fork removes the libsrtp/FFI dependency.",
+    "keywords": [
+        "srtp"
+    ],
+    "homepage": "https://github.com/danog/php-rtc-srtp",
+    "license": "BSD-3-Clause",
+    "authors": [
+        {
+            "name": "Amin Yazdanpanah",
+            "email": "github@aminyazdanpanah.com"
+        },
+        {
+            "name": "Sana Moniri",
+            "email": "s.mo@quasarstream.com"
+        },
+        {
+            "name": "Quasar Stream Community"
+        },
+        {
+            "name": "Daniil Gentili",
+            "email": "daniil@daniil.it"
+        }
+    ],
+    "require": {
+        "php-64bit": "^8.2",
+        "danog/php-rtc-exception": "^1.1.5",
+        "danog/php-rtc-mixin": "^1.1.6 || ^2.0",
+        "phpseclib/phpseclib": "^4.0"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^11.5 || ^12.0 || ^13.3.2",
+        "bamarni/composer-bin-plugin": "^1.9.1"
+    },
+    "autoload": {
+        "psr-4": {
+            "Webrtc\\Srtp\\": "src"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Tests\\Webrtc\\Srtp\\": "tests"
+        }
+    },
+    "minimum-stability": "stable",
+    "scripts": {
+        "post-install-cmd": [
+            "@composer bin all install --ansi"
+        ],
+        "post-update-cmd": [
+            "@composer bin all update --ansi"
+        ]
+    },
+    "config": {
+        "allow-plugins": {
+            "bamarni/composer-bin-plugin": true
+        }
+    },
+    "extra": {
+        "bamarni-bin": {
+            "bin-links": true,
+            "forward-command": true
+        }
+    }
+}

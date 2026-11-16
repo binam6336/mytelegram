@@ -1,0 +1,812 @@
+<?php
+
+/**
+ * This file is part of the PHP WebRTC package.
+ *
+ * (c) Amin Yazdanpanah <https://www.aminyazdanpanah.com/#contact>
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Webrtc\DTLS\DTLS;
+
+use Psr\Log\LoggerInterface;
+use Throwable;
+use Webrtc\DataChannel\RTCSctpTransportInterface;
+use Webrtc\DTLS\DTLS\Enum\SSLHandshakeState;
+use Webrtc\DTLS\Listener\DtlsTransportStateChangeListener;
+use Webrtc\DTLS\DTLS\Exception\DTLSException;
+use Webrtc\DTLS\DTLS\Exception\TLSException;
+use Webrtc\DTLS\DTLS\TLS\TLS;
+use Webrtc\ICE\Enum\IceRole;
+use Webrtc\ICE\Listener\IceTransportDataListener;
+use Webrtc\ICE\Listener\IceTransportDisconnectListener;
+use Webrtc\ICE\RTCIceTransportInterface;
+use Webrtc\Mixin\SerializableState;
+use Webrtc\NTP\NetworkTimeProtocol;
+use Webrtc\RTCP\Exception\RtcpExceptionInterface;
+use Webrtc\RTCP\RtcpPacket;
+use Webrtc\RTP\Exception\RtpExceptionInterface;
+use Webrtc\RTP\HeaderExtension\HeaderExtensionsMap;
+use Webrtc\RTP\Receiver\RtpReceiverInterface;
+use Webrtc\RTP\RTCRTPDtlsTransportInterface;
+use Webrtc\RTP\RtpPacket;
+use Webrtc\RTP\RtpRouter;
+use Webrtc\RTP\RtpUtility;
+use Webrtc\RTP\TransportSequenceNumbers;
+use Webrtc\RTP\Sender\RTCRtpSender;
+use Webrtc\RTP\Sender\RtpSenderInterface;
+use Webrtc\RTPParameter\RTCRtpReceiveParameters;
+use Webrtc\RTPParameter\RTCRtpSendParameters;
+use Webrtc\SCTP\RTCSctpDtlsTransportInterface;
+use Webrtc\SCTP\RTCSctpTransport;
+use Webrtc\SDP\DtlsParameter\RTCDtlsFingerprint;
+use Webrtc\SDP\DtlsParameter\RTCDtlsParameters;
+use Webrtc\SDP\Enum\DtlsRole;
+use Webrtc\Srtp\Exception\SrtpException;
+use Webrtc\Srtp\Exception\SrtpExceptionInterface;
+use Webrtc\Srtp\Exception\SrtpValidateException;
+use Webrtc\Srtp\Session;
+use Webrtc\DTLS\Exception\OpenSSLException;
+use Webrtc\DTLS\Exception\SSLException;
+use Webrtc\DTLS\Exception\SysCallException;
+use Webrtc\DTLS\Exception\ZeroReturnException;
+use Webrtc\Stats\enum\TLSState;
+use Webrtc\Stats\RTCStatsReport;
+use Webrtc\Stats\RTCTransportStats;
+
+/**
+ * Class RTCDtlsTransport
+ *
+ * Represents the DTLS transport layer for WebRTC communications.
+ * This class manages the secure transport of media and data channels over WebRTC,
+ * handling encryption/decryption, SRTP protection, and packet routing.
+ *
+ * Key responsibilities:
+ * - Establishing and maintaining DTLS connections
+ * - Managing SRTP sessions for media encryption
+ * - Routing RTP/RTCP packets to appropriate receivers/senders
+ * - Handling SCTP data channel traffic
+ * - Providing transport statistics
+ *
+ * @package Webrtc\DTLS\DTLS
+ */
+final class RTCDtlsTransport implements RTCRTPDtlsTransportInterface, TransportSequenceNumbers, RTCSctpDtlsTransportInterface, IceTransportDataListener, IceTransportDisconnectListener
+{
+    /** @var TLSState Current state of the DTLS transport */
+    private TLSState $state = TLSState::NEW;
+
+    /** @var LoggerInterface|null Optional logger for debugging */
+    private ?LoggerInterface $logger = null;
+
+    /** @var RTCTransportStats Transport statistics collector */
+    private RTCTransportStats $reportTransport;
+
+    /** @var RtpRouter Routes RTP/RTCP packets to appropriate handlers */
+    private RtpRouter $rtpRouter;
+
+    /** @var HeaderExtensionsMap Manages RTP header extensions */
+    private HeaderExtensionsMap $headerExtensionsMap;
+
+    /** @var RTCSctpTransportInterface|null SCTP transport for data channels */
+    private ?RTCSctpTransportInterface $sctpReceiver = null;
+
+    /** @var Session|null Inbound SRTP session for decrypting incoming media */
+    private ?Session $inboundSrtp = null;
+
+    /** @var Session|null Outbound SRTP session for encrypting outgoing media */
+    private ?Session $outboundSrtp = null;
+
+    /** @var TLS The underlying TLS/DTLS implementation */
+    private TLS $tls;
+
+    /** @var DtlsRole The role (client/server) in the DTLS handshake */
+    private DtlsRole $role = DtlsRole::Auto;
+
+    /** @var \WeakMap<DtlsTransportStateChangeListener, null> Listeners notified when the state changes. */
+    private \WeakMap $statechangeListeners;
+
+    /** @var int The transport-wide sequence number of the last RTP packet sent, see {@see self::nextTransportSequenceNumber()}. */
+    private int $transportSequenceNumber = 0;
+
+    /**
+     * RTCDtlsTransport constructor.
+     *
+     * @param RTCIceTransportInterface $transport The underlying ICE transport
+     * @param RTCCertificate $certificate The certificate to use for DTLS
+     * @throws OpenSSLException|SrtpException If initialization fails
+     */
+    public function __construct(private readonly RTCIceTransportInterface $transport, private readonly RTCCertificate $certificate)
+    {
+        /** @var \WeakMap<DtlsTransportStateChangeListener, null> */
+        $this->statechangeListeners = new \WeakMap();
+        $this->tls = TLS::create($this->certificate);
+        $this->reportTransport = new RTCTransportStats("transport_" . spl_object_id($this));
+        $this->rtpRouter = new RtpRouter();
+        $this->headerExtensionsMap = new HeaderExtensionsMap();
+        $transport->addDisconnectListener($this);
+    }
+
+    /**
+     * Register a listener notified when the transport state changes.
+     *
+     * Typed replacement for on('statechange'); the listener is a plain object captured by serialization.
+     */
+    public function addStateChangeListener(DtlsTransportStateChangeListener $listener): void
+    {
+        $this->statechangeListeners[$listener] = null;
+    }
+
+    /**
+     * Notify registered listeners that the transport state changed (was the "statechange" event).
+     */
+    private function notifyStateChange(): void
+    {
+        foreach ($this->statechangeListeners as $listener => $_) {
+            $listener->onDtlsTransportStateChange();
+        }
+    }
+
+    /**
+     * Handle a disconnecting close/error reported by the ICE transport (was the 'close'/'error'
+     * events). Typed replacement registered via addDisconnectListener().
+     */
+    #[\Override]
+    public function onIceTransportDisconnect(): void
+    {
+        $this->handleDisconnectingError();
+    }
+
+    /**
+     * Receive application data from the ICE transport (was the 'data' event). Typed replacement
+     * registered via addDataListener().
+     */
+    #[\Override]
+    public function onIceTransportData(string $data, int $componentId): void
+    {
+        $this->onReceivedData($data);
+    }
+
+    /**
+     * Encrypts and sends application data over the DTLS connection.
+     *
+     * @param string $data The plaintext data to send
+     * @throws SysCallException If a system call fails
+     * @throws OpenSSLException If OpenSSL operations fail
+     * @throws TLSException If TLS is not in the correct state
+     * @throws ZeroReturnException If the connection was closed
+     * @throws SSLException For general SSL errors
+     */
+#[\Override]
+    public function sendData(string $data): void
+    {
+        $encryptedData = $this->tls->encrypt($data);
+        if (strlen($encryptedData) > 0) {
+            $this->send($encryptedData);
+        }
+    }
+
+    /**
+     * Encrypts and sends RTP media data.
+     *
+     * @param string $data The RTP packet to send
+     * @throws SrtpException|DTLSException If encryption fails or connection isn't established
+     */
+#[\Override]
+    public function sendRtp(string $data): void
+    {
+        if ($this->state !== TLSState::CONNECTED) {
+            throw new DTLSException("Unable to send encrypted RTP: No connection established.");
+        }
+        if ($this->outboundSrtp === null) {
+            throw new DTLSException("Unable to send encrypted RTP: outbound SRTP session is not initialized.");
+        }
+
+        $encryptedRtp = $this->outboundSrtp->protect($data);
+        $this->send($encryptedRtp);
+    }
+
+    /**
+     * Encrypts and sends RTCP control data.
+     *
+     * @param string $data The RTCP packet to send
+     * @throws DTLSException|SrtpException If encryption fails or connection isn't established
+     */
+#[\Override]
+    public function sendRtcp(string $data): void
+    {
+        if ($this->state !== TLSState::CONNECTED) {
+            throw new DTLSException("Unable to send encrypted RTCP: No connection established.");
+        }
+        if ($this->outboundSrtp === null) {
+            throw new DTLSException("Unable to send encrypted RTCP: outbound SRTP session is not initialized.");
+        }
+
+        $encryptedRtcp = $this->outboundSrtp->protectRtcp($data);
+        $this->send($encryptedRtcp);
+    }
+
+    /**
+     * Gets the underlying TLS implementation.
+     *
+     * @return TLS The TLS instance
+     */
+    public function getTls(): TLS
+    {
+        return $this->tls;
+    }
+
+    /**
+     * Sets the inbound SRTP session.
+     *
+     * @param Session $inboundSrtp The SRTP session for decrypting incoming media
+     */
+    public function setInboundSrtp(Session $inboundSrtp): void
+    {
+        $this->inboundSrtp = $inboundSrtp;
+    }
+
+    /**
+     * Sets the outbound SRTP session.
+     *
+     * @param Session $outboundSrtp The SRTP session for encrypting outgoing media
+     */
+    public function setOutboundSrtp(Session $outboundSrtp): void
+    {
+        $this->outboundSrtp = $outboundSrtp;
+    }
+
+    /**
+     * Gets the local DTLS parameters including certificate fingerprints.
+     *
+     * @return RTCDtlsParameters The local DTLS parameters
+     * @throws OpenSSLException
+     */
+    public function getLocalParameters(): RTCDtlsParameters
+    {
+        return new RTCDtlsParameters($this->certificate->getFingerprints());
+    }
+
+    /**
+     * Sets the DTLS role (client/server/auto).
+     *
+     * @param DtlsRole $getRole The role to set
+     */
+    public function setRole(DtlsRole $getRole): void
+    {
+        $this->role = $getRole;
+    }
+
+    /**
+     * Gets the current DTLS role.
+     *
+     * @return DtlsRole The current role
+     */
+    public function getRole(): DtlsRole
+    {
+        return $this->role;
+    }
+
+    /**
+     * Sends any pending data from the BIO buffer.
+     */
+    private function sendBioData(): void
+    {
+        $bio = $this->tls->getBio();
+        while (($data = $bio->read()) !== null) {
+            $this->send($data);
+        }
+    }
+
+    /**
+     * Sends raw data through the underlying transport.
+     *
+     * @param string $data The data to send
+     */
+    public function send(string $data): void
+    {
+        $this->transport->send($data);
+        $this->reportTransport->handleSent($data);
+    }
+
+    /**
+     * Gets the transport statistics collector.
+     *
+     * @return RTCTransportStats The transport statistics
+     */
+#[\Override]
+    public function getReportTransport(): RTCTransportStats
+    {
+        return $this->reportTransport;
+    }
+
+    /**
+     * Removes an SCTP receiver (placeholder implementation).
+     *
+     * @param RTCSctpTransport $param The SCTP transport to remove
+     */
+#[\Override]
+    public function removeSctpReceiver(RTCSctpTransport $param): void
+    {
+        // TODO: Implement proper removal logic
+    }
+
+    /**
+     * Handles incoming data from the transport.
+     *
+     * @param string $data The received data
+     * @throws SysCallException|DTLSException If a system call fails
+     */
+    private function onReceivedData(string $data): void
+    {
+        $this->reportTransport->handleReceived($data);
+
+        $firstByte = ord($data[0]);
+        if ($firstByte > 19 && $firstByte < 64) {
+            $this->handleSctpData($data);
+        } elseif ($firstByte > 127 && $firstByte < 192) {
+            $this->handleSrtpData($data);
+        }
+    }
+
+    /**
+     * Starts the DTLS transport and begins the handshake process.
+     *
+     * @param RTCDtlsFingerprint[] $certificates Array of peer certificate fingerprints to validate
+     * @throws DTLSException If handshake or setup fails
+     * @throws OpenSSLException If OpenSSL operations fail
+     * @throws TLSException If TLS is not in the correct state
+     */
+    public function start(array $certificates): void
+    {
+        $this->setState(TLSState::CONNECTING);
+
+        // Start handshaking
+        try {
+            $this->tls->startHandshaking($this->transport, $this->getHandShakeState());
+        } catch (Throwable $e) {
+            $this->setFailedState("DTLS: " . $e->getMessage());
+            return;
+        }
+
+        // Check peer certificate fingerprint
+        if (!$this->tls->validatePeerCertificate($certificates)) {
+            $this->setFailedState("DTLS: Fingerprint mismatch!");
+            return;
+        }
+
+        // Setup inbound and outbound srtp
+        try {
+            $this->setupSrtp();
+        } catch (SrtpExceptionInterface $e) {
+            $this->setFailedState("DTLS: Failed setup srtp. " . $e->getMessage());
+            return;
+        }
+
+        // Deliver post-handshake application data to onReceivedData() via onIceTransportData().
+        $this->transport->addDataListener($this);
+
+        // Set success log and state
+        $this->logger?->debug("DTLS: Successful handshake");
+        $this->setState(TLSState::CONNECTED);
+    }
+
+    /**
+     * Stops the DTLS transport and cleans up resources.
+     *
+     * @return void Returns once shutdown is complete.
+     */
+    public function stop(): void
+    {
+        if (in_array($this->state, [TLSState::CONNECTING, TLSState::CONNECTED])) {
+            try {
+                $this->tls->shutdown(); // Attempt to shut down, regardless of success or failure.
+                $this->sendBioData();
+            } catch (\Throwable) {
+                // TODO: it should try 3 times before giving up
+            }
+            $this->setState(TLSState::CLOSED);
+            $this->logger?->debug("DTLS: DTLS shutdown process has been successfully completed. All secure connections have been terminated.");
+        }
+    }
+
+    /**
+     * Gets the underlying ICE transport.
+     *
+     * @return RTCIceTransportInterface The ICE transport
+     */
+#[\Override]
+    public function getIceTransport(): RTCIceTransportInterface
+    {
+        return $this->transport;
+    }
+
+    /**
+     * Gets the certificate used by this transport.
+     *
+     * @return RTCCertificate The certificate
+     */
+    public function getCertificate(): RTCCertificate
+    {
+        return $this->certificate;
+    }
+
+    /**
+     * Gets the peer certificate fingerprints.
+     *
+     * @return array<RTCDtlsFingerprint> Array of certificate fingerprints
+     * @throws OpenSSLException If fingerprint retrieval fails
+     */
+    public function getPeerCertificates(): array
+    {
+        return $this->certificate->getFingerprints();
+    }
+
+    /**
+     * Gets the current transport state.
+     *
+     * @return TLSState The current state
+     */
+#[\Override]
+    public function getState(): TLSState
+    {
+        return $this->state;
+    }
+
+    /**
+     * Gets the logger instance.
+     *
+     * @return LoggerInterface|null The logger or null if not set
+     */
+    public function getLogger(): ?LoggerInterface
+    {
+        return $this->logger;
+    }
+
+    /**
+     * Sets the logger instance.
+     *
+     * @param LoggerInterface|null $logger The logger to set
+     */
+    public function setLogger(?LoggerInterface $logger): void
+    {
+        $this->logger = $logger;
+        $this->tls->setLogger($logger);
+    }
+
+    /**
+     * Sets the SCTP transport for data channels.
+     *
+     * @param RTCSctpTransportInterface|null $sctpReceiver The SCTP transport to set
+     */
+#[\Override]
+    public function setSctpReceiver(?RTCSctpTransportInterface $sctpReceiver = null): void
+    {
+        $this->sctpReceiver = $sctpReceiver;
+    }
+
+    /**
+     * Sets up SRTP sessions for media encryption.
+     *
+     * @throws TLSException If TLS is not in the correct state
+     * @throws SrtpException If SRTP setup fails
+     * @throws DTLSException If connection isn't established
+     * @throws OpenSSLException If OpenSSL operations fail
+     * @throws SrtpValidateException If SRTP validation fails
+     */
+    public function setupSrtp(): void
+    {
+        $srtp = new Srtp();
+
+        $selectedProfile = $srtp->getProfile($this->tls->getSelectedSrtpProfile());
+        if ($selectedProfile === false) {
+            throw new SrtpException('The DTLS handshake did not negotiate any usable SRTP profile!');
+        }
+        $srtpKeyMaterial = $this->tls->exportKeyingMaterial($selectedProfile["keyLength"], $selectedProfile["saltLent"]);
+
+        // RFC 5764 section 4.2: the keying material is client_write_key | server_write_key | client_write_salt |
+        // server_write_salt, where "client" and "server" are the DTLS handshake roles (which are
+        // independent of the ICE role). The client protects what it sends with the client key, so we
+        // decrypt what the peer sends with THEIR key and encrypt what we send with OURS.
+        $isServer = $this->getHandShakeState() === SSLHandshakeState::Accept;
+
+        $this->inboundSrtp = $srtp->getInbound($srtpKeyMaterial, intval(!$isServer));
+        $this->outboundSrtp = $srtp->getOutbound($srtpKeyMaterial, intval($isServer));
+    }
+
+    /**
+     * Sets the transport state and emits statechange event if changed.
+     *
+     * @param TLSState $state The new state
+     */
+    public function setState(TLSState $state): void
+    {
+        if ($state !== $this->state) {
+            $this->logger?->debug(sprintf("State changed from %s to %s", $this->state->name, $state->name));
+            $this->state = $state;
+            $this->notifyStateChange();
+        }
+    }
+
+    /**
+     * Sets the transport to failed state with the given reason.
+     *
+     * @param string $reason The failure reason
+     * @param Throwable|null $e Optional exception that caused the failure
+     */
+    private function setFailedState(string $reason, ?Throwable $e = null): void
+    {
+        $this->logger?->error("DTLS: Failed handshaking or srtp setup.", ["reason" => $reason]);
+        $this->setState(TLSState::FAILED);
+    }
+
+    /**
+     * Handles transport disconnection or errors.
+     *
+     * @throws DTLSException Always throws to indicate connection loss
+     */
+    private function handleDisconnectingError(): never
+    {
+        $this->setState(TLSState::CLOSED);
+        $this->logger?->alert("DTLS: Connection lost");
+        $this->sctpReceiver?->onErrorOrClosed();
+
+        throw new DTLSException("DTLS: Connection lost");
+    }
+
+    /**
+     * Handles incoming SCTP data channel messages.
+     *
+     * @param string $data The received SCTP data
+     * @throws SysCallException If a system call fails
+     */
+    private function handleSctpData(string $data): void
+    {
+        try {
+            $decryptedData = $this->tls->decrypt($data);
+        } catch (ZeroReturnException) {
+            $this->stop();
+            return;
+        } catch (TLSException|OpenSSLException) {
+            // Carrying no application data does not mean the engine produced nothing: a peer
+            // that never saw our final flight retransmits its own, and the answer to that is
+            // queued right here. Returning without flushing left it sitting in the buffer,
+            // so the peer retransmitted until it gave up and the handshake never finished.
+            $this->sendBioData();
+
+            return;
+        }
+        // Flush whatever the engine queued in response — an ack, or the answer to a retransmit.
+        $this->sendBioData();
+
+        if ($decryptedData !== null) {
+            $this->sctpReceiver?->onReceived($decryptedData);
+        }
+    }
+
+    /**
+     * Handles incoming SRTP media packets.
+     *
+     * @param string $data The received SRTP data
+     * @throws DTLSException If RTP processing fails
+     */
+    private function handleSrtpData(string $data): void
+    {
+        $arrivalTimeMs = NetworkTimeProtocol::currentMs();
+        try {
+            if ($this->inboundSrtp === null) {
+                throw new DTLSException("Unable to process incoming SRTP: inbound SRTP session is not initialized.");
+            }
+            if (RtpUtility::isRtcp($data)) {
+                $decryptedRtcp = $this->inboundSrtp->unprotectRtcp($data);
+                $this->handleRtcpData($decryptedRtcp);
+            } else {
+                $decryptedRtp = $this->inboundSrtp->unprotect($data);
+                $this->handleRtpData($decryptedRtp, $arrivalTimeMs);
+            }
+        } catch (SrtpExceptionInterface $e) {
+            $this->logger?->debug(sprintf("DTLS: SRTP decryption failed: %s", $e->getMessage()));
+        }
+    }
+
+    /**
+     * Handles incoming RTCP control packets.
+     *
+     * @param string $data The RTCP packet data
+     * @throws DTLSException If connection isn't established
+     * @throws SrtpException If decryption fails
+     */
+    public function handleRtcpData(string $data): void
+    {
+        try {
+            $packets = RtcpPacket::decode($data);
+        } catch (RtcpExceptionInterface $e) {
+            $this->logger?->debug(sprintf("DTLS: RTCP parsing failed: %s", $e->getMessage()));
+            return;
+        }
+
+        foreach ($packets as $packet) {
+            // Route RTCP packet
+            /** @var array<int, RTCRtpSender|RtpReceiverInterface> $recipients */
+            $recipients = $this->rtpRouter->routeRtcp($packet);
+            foreach ($recipients as $recipient) {
+                $recipient->handleRtcpPacket($packet);
+            }
+        }
+    }
+
+    /**
+     * Handles incoming RTP media packets.
+     *
+     * @param string $data The RTP packet data
+     * @param int $arrivalTimeMs The packet arrival time in milliseconds
+     */
+    public function handleRtpData(string $data, int $arrivalTimeMs): void
+    {
+        try {
+            $packet = RtpPacket::decode($data, $this->headerExtensionsMap);
+        } catch (RtpExceptionInterface $e) {
+            $this->logger?->debug(sprintf("DTLS: RTP parsing failed: %s", $e->getMessage()));
+            return;
+        }
+
+        // Route RTP packet
+        $receiver = $this->rtpRouter->routeRtp($packet);
+        $receiver?->handleRtpPacket($packet, $arrivalTimeMs);
+    }
+
+    /**
+     * The transport-wide sequence number of the next RTP packet, shared by all of the senders of the transport.
+     *
+     * @return int A 16-bit number.
+     */
+    #[\Override]
+    public function nextTransportSequenceNumber(): int
+    {
+        return $this->transportSequenceNumber = ($this->transportSequenceNumber + 1) & 0xFFFF;
+    }
+
+    /**
+     * Gets the current transport statistics.
+     *
+     * @return RTCStatsReport The statistics report
+     */
+    public function getStats(): RTCStatsReport
+    {
+        $this->reportTransport->timestamp = microtime(true) * 1000.0;
+        unset($this->reportTransport->dateTime);
+
+        $report = new RTCStatsReport();
+        $report->add($this->reportTransport);
+
+        return $report;
+    }
+
+    /**
+     * Registers an RTP receiver with the transport.
+     *
+     * @param RtpReceiverInterface $receiver The RTP receiver to register
+     * @param RTCRtpReceiveParameters $parameters The receiver parameters
+     */
+#[\Override]
+    public function setRtpReceiver(RtpReceiverInterface $receiver, RTCRtpReceiveParameters $parameters): void
+    {
+        $ssrcs = [];
+        foreach ($parameters->encodings as $encoding) {
+            $ssrcs[] = $encoding->ssrc;
+            // The retransmissions of the encoding come on their own SSRC: without it, they are routed only by
+            // payload type, which fails as soon as another receiver has the same RTX payload type.
+            if ($encoding->rtx !== null) {
+                $ssrcs[] = $encoding->rtx->ssrc;
+            }
+        }
+
+        $this->headerExtensionsMap->configure($parameters);
+        $payloadTypes = [];
+        foreach ($parameters->codecs as $codec) {
+            assert($codec->payloadType !== null);
+            $payloadTypes[] = $codec->payloadType;
+        }
+
+        $this->rtpRouter->setReceiver(
+            $receiver,
+            $ssrcs,
+            $payloadTypes,
+            $parameters->muxId
+        );
+    }
+
+    /**
+     * Removes an RTP receiver from the transport.
+     *
+     * @param RtpReceiverInterface $receiver The receiver to remove
+     */
+#[\Override]
+    public function removeRtpReceiver(RtpReceiverInterface $receiver): void
+    {
+        $this->rtpRouter->removeReceiver($receiver);
+    }
+
+    /**
+     * Registers an RTP sender with the transport.
+     *
+     * @param RtpSenderInterface $sender The RTP sender to register
+     * @param RTCRtpSendParameters $parameters The sender parameters
+     */
+#[\Override]
+    public function setRtpSender(RtpSenderInterface $sender, RTCRtpSendParameters $parameters): void
+    {
+        $this->headerExtensionsMap->configure($parameters);
+
+        $ssrc = null;
+        foreach ($parameters->encodings as $encoding) {
+            $ssrc = $encoding->ssrc;
+            break;
+        }
+        if ($ssrc === null) {
+            throw new DTLSException('No usable SSRC in the sender parameters!');
+        }
+
+        $this->rtpRouter->setSender($sender, $ssrc);
+    }
+
+    /**
+     * Removes an RTP sender from the transport.
+     *
+     * @param RtpSenderInterface $sender The sender to remove
+     */
+#[\Override]
+    public function removeRtpSender(RtpSenderInterface $sender): void
+    {
+        // A transport that never finished constructing (e.g. one restored from a half-built, killed
+        // session) has no router yet; tearing its senders down during destruction must not crash.
+        /** @psalm-suppress RedundantPropertyInitializationCheck the constructor can throw before this is set */
+        if (!isset($this->rtpRouter)) {
+            return;
+        }
+        $this->rtpRouter->removeSender($sender);
+    }
+
+    /**
+     * Determines the handshake state based on the current role.
+     *
+     * @return SSLHandshakeState The appropriate handshake state
+     */
+    private function getHandShakeState(): SSLHandshakeState
+    {
+        if ($this->role === DtlsRole::Auto) {
+            $this->role = $this->transport->getRole() === IceRole::Controlling ? DtlsRole::Server : DtlsRole::Client;
+        }
+
+        return $this->role === DtlsRole::Server ? SSLHandshakeState::Accept : SSLHandshakeState::Connect;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function __serialize(): array
+    {
+        $state = SerializableState::export($this, [
+            // WeakMaps cannot be serialized; snapshot their keys and rebuild on the far side.
+            'statechangeListeners' => ['__uninitialized' => true],
+        ]);
+        $state['__statechangeListeners'] = SerializableState::weakMapToList($this->statechangeListeners);
+
+        return $state;
+    }
+
+    /**
+     * @param array<string, mixed> $data
+     */
+    public function __unserialize(array $data): void
+    {
+        /** @var list<DtlsTransportStateChangeListener> $statechangeListeners */
+        $statechangeListeners = $data['__statechangeListeners'] ?? [];
+        unset($data['__statechangeListeners']);
+
+        SerializableState::import($this, $data);
+        /** @var \WeakMap<DtlsTransportStateChangeListener, null> */
+        $this->statechangeListeners = SerializableState::listToWeakMap($statechangeListeners);
+    }
+}

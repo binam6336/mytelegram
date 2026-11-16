@@ -1,0 +1,12 @@
+/.phpunit.cache
+/coverage-report
+/vendor
+/.idea
+composer.lock
+.gitignorevendor
+.phpunit.cache
+composer.lock
+.phpunit.cache
+composer.lock
+vendor
+vendor

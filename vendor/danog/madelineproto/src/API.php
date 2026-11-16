@@ -1,0 +1,563 @@
+<?php
+
+declare(strict_types=1);
+
+/**
+ * API module.
+ *
+ * This file is part of MadelineProto.
+ * MadelineProto is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+ * MadelineProto is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU Affero General Public License for more details.
+ * You should have received a copy of the GNU General Public License along with MadelineProto.
+ * If not, see <http://www.gnu.org/licenses/>.
+ *
+ * @author    Daniil Gentili <daniil@daniil.it>
+ * @copyright 2016-2025 Daniil Gentili <daniil@daniil.it>
+ * @license   https://opensource.org/licenses/AGPL-3.0 AGPLv3
+ * @link https://docs.madelineproto.xyz MadelineProto documentation
+ */
+
+namespace danog\MadelineProto;
+
+use Amp\CancelledException;
+use Amp\DeferredFuture;
+use Amp\Future;
+use Amp\Future\UnhandledFutureError;
+use Amp\Ipc\Sync\ChannelledSocket;
+use Amp\SignalException;
+use Amp\TimeoutException;
+use danog\MadelineProto\ApiWrappers\Start;
+use danog\MadelineProto\Ipc\AlreadyServedException;
+use danog\MadelineProto\Ipc\Client;
+use danog\MadelineProto\Ipc\Server;
+use danog\MadelineProto\Settings\Ipc as SettingsIpc;
+use danog\MadelineProto\Settings\Logger as SettingsLogger;
+use danog\MadelineProto\Settings\Templates;
+use danog\MadelineProto\WebUI\WebUI;
+use Revolt\EventLoop;
+use Revolt\EventLoop\UncaughtThrowable;
+use Throwable;
+use Webmozart\Assert\Assert;
+
+use function Amp\async;
+use function Amp\Future\await;
+use function Amp\Future\awaitFirst;
+
+/**
+ * Main API wrapper for MadelineProto.
+ */
+final class API extends AbstractAPI
+{
+    /**
+     * Release version.
+     *
+     * @var string
+     */
+    public const RELEASE = '8.21.2';
+    /**
+     * We're not logged in.
+     *
+     * @var int
+     */
+    public const NOT_LOGGED_IN = 0;
+    /**
+     * We're waiting for the login code.
+     *
+     * @var int
+     */
+    public const WAITING_CODE = 1;
+    /**
+     * We're waiting for parameters to sign up.
+     *
+     * @var int
+     */
+    public const WAITING_SIGNUP = -1;
+    /**
+     * We're waiting for the 2FA password.
+     *
+     * @var int
+     */
+    public const WAITING_PASSWORD = 2;
+    /**
+     * We're logged in.
+     *
+     * @var int
+     */
+    public const LOGGED_IN = 3;
+    /**
+     * We're logged out, the session will be deleted ASAP.
+     *
+     * @var int
+     */
+    public const LOGGED_OUT = 4;
+    /**
+     * This peer is a user.
+     *
+     * @var string
+     */
+    public const PEER_TYPE_USER = 'user';
+    /**
+     * This peer is a bot.
+     *
+     * @var string
+     */
+    public const PEER_TYPE_BOT = 'bot';
+    /**
+     * This peer is a normal group.
+     *
+     * @var string
+     */
+    public const PEER_TYPE_GROUP = 'chat';
+    /**
+     * This peer is a supergroup.
+     *
+     * @var string
+     */
+    public const PEER_TYPE_SUPERGROUP = 'supergroup';
+    /**
+     * This peer is a channel.
+     *
+     * @var string
+     */
+    public const PEER_TYPE_CHANNEL = 'channel';
+    /**
+     * This peer is a community.
+     *
+     * @var string
+     */
+    public const PEER_TYPE_COMMUNITY = 'community';
+    /**
+     * Whether to generate only peer information.
+     */
+    public const INFO_TYPE_PEER = 0;
+    /**
+     * Whether to generate only constructor information.
+     */
+    public const INFO_TYPE_CONSTRUCTOR = 1;
+    /**
+     * Whether to generate only ID information.
+     */
+    public const INFO_TYPE_ID = 2;
+    /**
+     * Whether to generate all information.
+     */
+    public const INFO_TYPE_ALL = 3;
+    /**
+     * Whether to generate all usernames.
+     */
+    public const INFO_TYPE_USERNAMES = 4;
+    /**
+     * Whether to generate just type info.
+     */
+    public const INFO_TYPE_TYPE = 5;
+
+    use Start;
+    /**
+     * Session paths.
+     *
+     * @internal
+     */
+    private SessionPaths $session;
+
+    /**
+     * Unlock callback.
+     *
+     * @var ?callable
+     */
+    private $unlock = null;
+
+    /**
+     * Constructor function.
+     *
+     * @param string           $session  Session name
+     * @param SettingsAbstract $settings Settings
+     */
+    public function __construct(string $session, ?SettingsAbstract $settings = null)
+    {
+        Magic::start(light: true);
+        $settings ??= new SettingsEmpty;
+        // The assets of the web UI (scripts, animations...), requested by its pages from this same script
+        if (PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg' && isset($_GET[WebUI::ASSET_PARAMETER])) {
+            $templates = match (true) {
+                $settings instanceof Settings => $settings->getTemplates(),
+                $settings instanceof Templates => $settings,
+                default => new Templates,
+            };
+            if (WebUI::serveAsset($templates)) {
+                die;
+            }
+        }
+        $this->session = new SessionPaths($session);
+        $this->wrapper = new APIWrapper($this->session);
+        $this->exportNamespaces();
+
+        Logger::constructorFromSettings($settings instanceof Settings
+            ? $settings->getLogger()
+            : ($settings instanceof SettingsLogger ? $settings : new SettingsLogger));
+
+        if ($this->connectToMadelineProto($settings)) {
+            if (!$settings instanceof SettingsEmpty) {
+                EventLoop::queue($this->updateSettings(...), $settings);
+            }
+            return; // OK
+        }
+
+        if (!$settings instanceof Settings) {
+            $newSettings = new Settings;
+            $newSettings->merge($settings);
+            $settings = $newSettings;
+        }
+
+        $appInfo = $settings->getAppInfo();
+        if (!$appInfo->hasApiInfo()) {
+            if (!$appInfo->getShowPrompt()) {
+                throw new Exception("No API ID or API hash was provided, please specify them in the settings!");
+            }
+            $app = $this->APIStart($settings);
+            if (!$app) {
+                die();
+            }
+            $appInfo->setApiId($app['api_id']);
+            $appInfo->setApiHash($app['api_hash']);
+        }
+        // Set without finishing the web setup (in the settings, for example): drop its my.telegram.org login
+        $this->session->storeApiSetupState(null);
+        $this->wrapper->setAPI(new MTProto($settings, $this->wrapper));
+        $this->wrapper->logger('Prompting initial serialization...');
+        $this->wrapper->serialize();
+        $this->wrapper->logger('Done initial serialization!');
+        $this->destruct();
+        if (!$this->connectToMadelineProto($settings)) {
+            throw new Exception("Could not start IPC server!");
+        }
+
+        $this->wrapper->logger(Lang::$current_lang['madelineproto_ready'], Logger::NOTICE);
+    }
+
+    /**
+     * Reconnect to full instance.
+     */
+    #[\Override]
+    protected function reconnectFull(): bool
+    {
+        if ($this->wrapper->getAPI() instanceof Client) {
+            $this->wrapper->logger('Restarting to full instance...');
+            try {
+                if (!isset($_GET['MadelineSelfRestart']) && (($this->hasEventHandler()) || !($this->isIpcWorker()))) {
+                    $this->wrapper->logger('Restarting to full instance: the bot is already running!');
+                    Tools::closeConnection($this->getWebMessage(Lang::$current_lang['botAlreadyRunning']));
+                    return false;
+                }
+                $this->wrapper->logger('Restarting to full instance: stopping IPC server...');
+                $this->wrapper->getAPI()->stopIpcServer();
+            } catch (SecurityException|SignalException $e) {
+                throw $e;
+            } catch (Throwable $e) {
+                if ($e instanceof UncaughtThrowable) {
+                    $e = $e->getPrevious();
+                    if ($e instanceof SecurityException || $e instanceof SignalException) {
+                        throw $e;
+                    }
+                }
+                $this->wrapper->logger("Restarting to full instance: error $e");
+            }
+            $this->wrapper->logger('Restarting to full instance: reconnecting...');
+            $cancel = new DeferredFuture;
+            $cb = function () use ($cancel, &$cb): void {
+                [$result] = Serialization::tryConnect($this->session->getIpcPath(), $cancel->getFuture());
+                if ($result instanceof ChannelledSocket) {
+                    try {
+                        if (!$this->wrapper->getAPI() instanceof Client) {
+                            $this->wrapper->logger('Restarting to full instance (again): the bot is already running!');
+                            $result->disconnect();
+                            return;
+                        }
+                        $this->wrapper->logger('Restarting to full instance (again): sending shutdown signal!');
+                        $result->send(Server::SHUTDOWN);
+                        $result->disconnect();
+                    } catch (SecurityException|SignalException $e) {
+                        throw $e;
+                    } catch (Throwable $e) {
+                        if ($e instanceof UncaughtThrowable) {
+                            $e = $e->getPrevious();
+                            if ($e instanceof SecurityException || $e instanceof SignalException) {
+                                throw $e;
+                            }
+                        }
+                        $this->wrapper->logger("Restarting to full instance: error in stop loop $e");
+                    }
+                    // Repeated until we get the session, but not right away: it spun as long as a server accepted connections without stopping
+                    EventLoop::delay(1.0, static fn () => $cb());
+                }
+            };
+            EventLoop::queue($cb);
+            $this->connectToMadelineProto(new SettingsEmpty, true);
+            $cancel->complete(new Exception('Connected!'));
+        }
+        return true;
+    }
+    /**
+     * Connect to MadelineProto.
+     *
+     * @param SettingsAbstract $settings  Settings
+     * @param bool             $forceFull Whether to force full initialization
+     */
+    protected function connectToMadelineProto(SettingsAbstract $settings, bool $forceFull = false, bool $tryReconnect = true): bool
+    {
+        if ($settings instanceof SettingsIpc) {
+            $forceFull = $forceFull || $settings->getSlow();
+        } elseif ($settings instanceof Settings) {
+            $forceFull = $forceFull || $settings->getIpc()->getSlow();
+        }
+        $selfRestart = !$forceFull && isset($_GET['MadelineSelfRestart']) && !Magic::$altervista;
+        $forceFull = $forceFull || $selfRestart || Magic::$altervista;
+
+        $future = async(
+            Serialization::unserialize(...),
+            $this->session,
+            $settings,
+            $forceFull,
+            $selfRestart,
+        );
+        while (true) {
+            try {
+                [$unserialized, $this->unlock] = $future->await(Tools::getTimeoutCancellation(30.0, "Timeout during session unserialization!"));
+                break;
+            } catch (CancelledException $e) {
+                if (!$e->getPrevious() instanceof TimeoutException) {
+                    throw $e;
+                }
+                // The lock holder is alive (a lock dies with its process): it's loading the session, which
+                // can take a while with a big database, and serves it once it's done, or it's shutting down
+                // to let us in. Either way, giving up now would fail a startup that is going well.
+                if (Serialization::isLockedByAnotherProcess($this->session)) {
+                    Logger::log('The session is still locked by another process (loading or releasing it), waiting...');
+                    continue;
+                }
+                // Waiting for the event handler, whose class this script lacks: unserialize() bounds that wait
+                // itself (it may outlast this timeout), and reports the missing class.
+                if (Serialization::getMissingEventHandler($this->session) !== null) {
+                    continue;
+                }
+                $future->ignore();
+                [$unserialized, $this->unlock] = [0, null];
+                break;
+            }
+        }
+
+        if ($unserialized === 0) {
+            // Timeout
+            throw new Exception(Lang::$current_lang['could_not_connect_to_MadelineProto']);
+        } elseif ($unserialized instanceof Throwable) {
+            // IPC server error
+            throw $unserialized;
+        } elseif ($unserialized instanceof ChannelledSocket) {
+            if (Magic::$isIpcWorker) {
+                // A worker is only useful as the server: as a client, it would wait for a shutdown forever.
+                $unserialized->disconnect();
+                throw new AlreadyServedException("Another process is already serving the session {$this->session->getSessionDirectoryPath()}");
+            }
+            // Success, IPC client
+            Server::warnIfOverTcp($this->session);
+            $this->wrapper->setAPI($client = new Client($unserialized, $this->session, Logger::$default));
+            if (\defined('MADELINE_PHAR') && \defined('MADELINE_PHAR_VERSION') && \defined('MADELINE_PHP')) {
+                // Short-lived clients (like dl.php) exit before completing the update check, and their phars may be
+                // in another directory than the worker's: the worker brings both to the newest release.
+                try {
+                    $client->syncIpcClientPhar(self::RELEASE, \MADELINE_PHAR, \MADELINE_PHAR_VERSION, \MADELINE_PHP);
+                } catch (Throwable $e) {
+                    // Workers older than this method
+                    Logger::log("Could not sync the phar with the IPC server: $e", Logger::NOTICE);
+                }
+            }
+            return true;
+        } elseif ($unserialized) {
+            // Success, full session
+            $this->wrapper->getAPI()?->unreference();
+            $this->wrapper = $unserialized;
+            $this->wrapper->setSession($this->session);
+            $this->exportNamespaces();
+            if ($this->wrapper->getAPI()) {
+                unset($unserialized);
+
+                if ($settings instanceof SettingsIpc) {
+                    $settings = new SettingsEmpty;
+                }
+                try {
+                    $this->wrapper->getAPI()->wakeup($settings, $this->wrapper);
+                } catch (Throwable $e) {
+                    // Not saved at shutdown (by serializeAll() or the destructor): the session on disk is the one
+                    // that failed to wake up, a half-initialized instance must not overwrite it.
+                    $this->wrapper->setAPI(null);
+                    throw $e;
+                }
+                $this->wrapper->logger(Lang::$current_lang['madelineproto_ready'], Logger::NOTICE);
+                return true;
+            }
+        }
+        return false;
+    }
+    /**
+     * Wakeup function.
+     */
+    public function __wakeup(): void
+    {
+        $this->__construct($this->session->getSessionDirectoryPath());
+    }
+    /**
+     * @psalm-pure
+     */
+    #[\Override]
+    public function __sleep(): array
+    {
+        return ['session'];
+    }
+    /**
+     * @var array<Future<null>>
+     */
+    private static array $destructors = [];
+    /**
+     * @internal
+     */
+    public static function finalize(): void
+    {
+        if (self::$destructors) {
+            await(self::$destructors);
+        }
+    }
+
+    private function destruct(int|null $id = null): void
+    {
+        $this->wrapper->logger('Shutting down MadelineProto ('.static::class.')');
+        $this->wrapper->getAPI()?->unreference();
+        if (isset($this->wrapper)) {
+            $this->wrapper->logger('Prompting final serialization...');
+            $this->wrapper->serialize();
+            $this->wrapper->logger('Done final serialization!');
+        }
+        if ($this->unlock) {
+            ($this->unlock)();
+        }
+        if ($id !== null) {
+            unset(self::$destructors[$id]);
+        }
+    }
+    /**
+     * Destruct function.
+     *
+     * @internal
+     */
+    public function __destruct()
+    {
+        $id = \count(self::$destructors);
+        self::$destructors[$id] = async($this->destruct(...), $id);
+    }
+
+    /**
+     * The instances that aren't logged in yet, key => name: the key if it is a string, or the name of the session.
+     *
+     * @param array<API> $instances
+     * @return array<string, string>
+     */
+    private static function getSessionsToLogIn(array $instances): array
+    {
+        $sessions = [];
+        foreach ($instances as $k => $instance) {
+            if ($instance->getAuthorization() !== self::LOGGED_IN) {
+                // Never the path of the session, which the page would show to anyone
+                $sessions[(string) $k] = \is_string($k) ? $k : basename($instance->session->getSessionDirectoryPath());
+            }
+        }
+        return $sessions;
+    }
+
+    /**
+     * Start multiple instances of MadelineProto and the event handlers (enables async).
+     *
+     * In the browser, the login pages let you choose which of the sessions that aren't logged in yet to log in
+     * (named by their key in $instances if it is a string, otherwise by their session).
+     *
+     * @param array<API>                                                   $instances    Instances of madeline
+     * @param array<class-string<EventHandler>>|class-string<EventHandler> $eventHandler Event handler(s)
+     */
+    public static function startAndLoopMulti(array $instances, array|string $eventHandler): void
+    {
+        if (\is_string($eventHandler)) {
+            Assert::classExists($eventHandler);
+            $eventHandler::cachePlugins($eventHandler);
+            $eventHandler = array_fill_keys(array_keys($instances), $eventHandler);
+        } else {
+            Assert::notEmpty($eventHandler);
+            Assert::allClassExists($eventHandler);
+            foreach ($eventHandler as $c) {
+                $c::cachePlugins($c);
+            }
+        }
+
+        $errors = [];
+        $started = array_fill_keys(array_keys($instances), false);
+        $instanceOne = array_values($instances)[0];
+
+        $prev = EventLoop::getErrorHandler();
+        EventLoop::setErrorHandler(
+            $cb = static function (Throwable $e) use ($instanceOne, &$errors, &$started, $eventHandler): void {
+                if ($e instanceof UnhandledFutureError) {
+                    $e = $e->getPrevious();
+                }
+                if ($e instanceof SecurityException || $e instanceof SignalException) {
+                    throw $e;
+                }
+                if (str_starts_with($e->getMessage(), 'Could not connect to DC ')) {
+                    throw $e;
+                }
+                $t = time();
+                $errors = [$t => $errors[$t] ?? 0];
+                $errors[$t]++;
+                if ($errors[$t] > 10 && array_sum($started) !== \count($eventHandler)) {
+                    $instanceOne->wrapper->logger('More than 10 errors in a second and not inited, exiting!', Logger::FATAL_ERROR);
+                    return;
+                }
+                $eOrig = (string) $e;
+                $e = Tools::taintEscape((string) $e);
+                echo $e;
+                $instanceOne->wrapper->logger($eOrig, Logger::FATAL_ERROR);
+                $instanceOne->report("Surfaced: $eOrig");
+            }
+        );
+
+        try {
+            $promises = [];
+            $order = $instances;
+            $web = PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg' && \count($instances) > 1;
+            if ($web) {
+                // In the browser, start() shows the login page of a session that isn't logged in, and ends the
+                // request: the one chosen on the page (or the first not logged in) is started first. It also
+                // answers the requests of its page (a QR code poll, which a session logged in would answer with a
+                // reload)
+                $requested = WebUI::getRequestedSession();
+                $first = $requested !== null && isset($instances[$requested])
+                    ? $requested
+                    : array_key_first(self::getSessionsToLogIn($instances));
+                if ($first !== null) {
+                    $order = [$first => $instances[$first]] + $instances;
+                }
+            }
+            foreach ($order as $k => $instance) {
+                if ($web) {
+                    WebUI::setSessions(self::getSessionsToLogIn($instances), (string) $k);
+                }
+                $instance->start();
+                $promises []= async(static function () use ($k, $instance, $eventHandler, &$started): void {
+                    $instance->startAndLoopLogic($eventHandler[$k], $started[$k]);
+                });
+            }
+            awaitFirst($promises);
+        } finally {
+            WebUI::setSessions([], null);
+            if (EventLoop::getErrorHandler() === $cb) {
+                EventLoop::setErrorHandler($prev);
+            }
+        }
+    }
+}

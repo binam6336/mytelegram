@@ -1,0 +1,230 @@
+<?php
+
+/**
+ * This file is part of the PHP WebRTC package.
+ *
+ * (c) Amin Yazdanpanah <https://www.aminyazdanpanah.com/#contact>
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Webrtc\AVCodec;
+
+use FFI;
+use FFI\Exception as FFIException;
+use Throwable;
+use Webrtc\AVCodec\Exception\AvCodecException;
+
+/**
+ * Class AVCodec
+ *
+ * This class provides methods to initialize the AVCodec library and handle
+ * AVCodec-related operations.
+ */
+class AVCodec
+{
+    /**
+     * The minimum supported major version of libavcodec.
+     */
+    private const SUPPORTED_VERSION = 9;
+
+    /**
+     * The path to the AVCodec C header file.
+     */
+    private const HEADER_FILE_PATH = __DIR__ . "/libav/include/avcodec.h";
+
+    /**
+     * Initializes the AVCodec library.
+     *
+     * This method attempts to load the libavcodec shared library via FFI, verify its version,
+     * and set the necessary constants. If initialization fails, a detailed exception is thrown.
+     *
+     * @param bool $debug Whether to enable debug logging for AVCodec.
+     *
+     * @return void
+     *
+     * @throws AvCodecException If the AVCodec library cannot be loaded or the version is unsupported.
+     */
+    /**
+     * Report whether the FFmpeg stack this package binds against can actually be loaded.
+     *
+     * Transcoding is optional: media that is already encoded is packetized without FFI, so
+     * callers use this to decide whether transcoding is on the table rather than to decide
+     * whether they can proceed at all.
+     *
+     * @return bool True when libavcodec, libavformat and libavfilter all load and match.
+     */
+    public static function isAvailable(): bool
+    {
+        if (!extension_loaded('FFI')) {
+            return false;
+        }
+
+        try {
+            self::init();
+            AVFormat::init();
+            AVFilter::init();
+        } catch (Throwable) {
+            return false;
+        }
+
+        return true;
+    }
+
+    public static function init(bool $debug = false): void
+    {
+        global $libAVCodec;
+
+        if (!isset($libAVCodec)) {
+            try {
+                $lib = getenv("LIB_AVCODEC_PATH") ?: self::getLibPath();
+
+                // Bind into a local first. A library that fails the check below must not be left
+                // behind in the global, or the next init() call would see it already set, skip the
+                // check and hand out a binding whose struct layouts do not match the loaded ABI.
+                $binding = FFI::cdef(file_get_contents(self::HEADER_FILE_PATH), $lib);
+
+                LibraryVersion::assertSupported(
+                    $binding->av_version_info(),
+                    self::SUPPORTED_VERSION,
+                    "libavcodec"
+                );
+
+                $libAVCodec = $binding;
+
+                self::setDefinition();
+
+                if ($debug) {
+                    $logCallback = function ($avcl, $level, $fmt, $args) {
+                        echo "[FFmpeg] $fmt\n";
+                    };
+                    $libAVCodec->av_log_set_callback($logCallback);
+                } else {
+                    $libAVCodec->av_log_set_level(-8);
+                }
+
+            } catch (FFIException $e) {
+                $os = PHP_OS_FAMILY;
+                $installHint = match ($os) {
+                    'Windows' => <<<EOT
+Download and install FFmpeg 9 with development files (DLLs) from https://ffmpeg.org/download.html.
+Make sure avcodec-*.dll is in your PATH or specify the LIB_AVCODEC_PATH environment variable.
+EOT,
+                    'Darwin' => <<<EOT
+Install FFmpeg with development headers on macOS:
+
+    brew install ffmpeg
+
+Ensure it is version 9.x. You may need to use:
+
+    brew upgrade ffmpeg
+
+If your Homebrew version is too old, you might need to tap a custom formula or build from source.
+EOT,
+                    'Linux' => <<<EOT
+Install FFmpeg development packages on Linux:
+
+For Debian/Ubuntu:
+
+    sudo apt update
+    sudo apt install libavcodec-dev
+
+For Fedora/RHEL:
+
+    sudo dnf install ffmpeg-devel
+
+Make sure the installed version is 9.x. If your package manager provides an older version, consider building FFmpeg manually from source.
+EOT,
+                    default => "Please install FFmpeg 9 and ensure the development libraries (headers and shared libs) are available on your system. See https://ffmpeg.org/download.html for instructions."
+                };
+
+                throw new AvCodecException(sprintf(
+                    "Couldn't load AvCodec library: %s\n\nInstallation instructions:\n%s",
+                    $e->getMessage(),
+                    $installHint
+                ), $e->getCode(), $e);
+            }
+        }
+    }
+
+    /**
+     * Defines the necessary constants related to AVCodec if not already defined.
+     *
+     * @return void
+     */
+    private static function setDefinition(): void
+    {
+        // FFmpeg reports "try again" as AVERROR(EAGAIN), -errno: errno values differ across platforms.
+        define("EAGAIN", \in_array(PHP_OS_FAMILY, ['Darwin', 'BSD'], true) ? 35 : 11);
+        define("AVERROR_EOF", -541478725);
+        define("AV_CODEC_CAP_VARIABLE_FRAME_SIZE", (1 << 16));
+
+        /**
+         * AV_ROUND constants for rounding operations
+         */
+        define('AV_ROUND_ZERO', 0);       // Round toward zero
+        define('AV_ROUND_INF', 1);        // Round away from zero
+        define('AV_ROUND_DOWN', 2);       // Round toward negative infinity
+        define('AV_ROUND_UP', 3);         // Round toward positive infinity
+        define('AV_ROUND_NEAR_INF', 5);   // Round to nearest and ties away from zero
+        define('AV_ROUND_PASS_MINMAX', 8192); // Flag to pass INT64_MIN/MAX through unchanged
+
+        /**
+         * Integer limit constants
+         */
+        define('INT64_MIN', -9223372036854775808);  // Minimum value for 64-bit signed integer
+        define('INT64_MAX', 9223372036854775807);   // Maximum value for 64-bit signed integer
+        define('UINT64_C', '0xFFFFFFFFFFFFFFFF');   // Unsigned 64-bit integer constant
+    }
+
+    /**
+     * Determines and returns the appropriate libavcodec shared library path.
+     *
+     * This method tries common library locations based on the operating system
+     * and returns the most probable path to the libavcodec shared library.
+     * If no common path is found, it returns a generic library name.
+     *
+     * @return string The path or name of the libavcodec shared library.
+     */
+    private static function getLibPath(): string
+    {
+        $os = PHP_OS_FAMILY;
+
+        if ($os === 'Windows') {
+            $candidates = [
+                'avcodec-63.dll',
+                'avcodec.dll',
+            ];
+        } elseif ($os === 'Darwin') { // macOS
+            $candidates = [
+                '/usr/local/lib/libavcodec.dylib',
+                '/opt/homebrew/lib/libavcodec.dylib',
+                'libavcodec.dylib',
+            ];
+        } elseif ($os === 'Linux') {
+            $candidates = [
+                '/usr/lib/x86_64-linux-gnu/libavcodec.so',
+                '/usr/local/lib/libavcodec.so',
+                'libavcodec.so',
+            ];
+        } else {
+            $candidates = [
+                'libavcodec',
+            ];
+        }
+
+        foreach ($candidates as $candidate) {
+            if (is_file($candidate) || @file_exists($candidate)) {
+                return $candidate;
+            }
+        }
+
+        return match ($os) {
+            'Windows' => 'avcodec.dll',
+            'Darwin' => 'libavcodec.dylib',
+            'Linux' => 'libavcodec.so',
+            default => 'libavcodec',
+        };
+    }
+}

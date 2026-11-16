@@ -1,0 +1,89 @@
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Crypt module.
+ *
+ * This file is part of MadelineProto.
+ * MadelineProto is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+ * MadelineProto is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU Affero General Public License for more details.
+ * You should have received a copy of the GNU General Public License along with MadelineProto.
+ * If not, see <http://www.gnu.org/licenses/>.
+ *
+ * @author    Daniil Gentili <daniil@daniil.it>
+ * @copyright 2016-2025 Daniil Gentili <daniil@daniil.it>
+ * @license   https://opensource.org/licenses/AGPL-3.0 AGPLv3
+ * @link https://docs.madelineproto.xyz MadelineProto documentation
+ */
+
+namespace danog\MadelineProto\MTProtoTools\Crypt;
+
+use danog\MadelineProto\Magic;
+use danog\MadelineProto\MTProtoTools\Crypt;
+
+/**
+ * Continuous mode IGE implementation.
+ *
+ * @internal
+ */
+abstract class IGE
+{
+    /**
+     * IV part 1.
+     *
+     */
+    protected string $iv_part_1;
+    /**
+     * IV part 2.
+     *
+     */
+    protected string $iv_part_2;
+    /**
+     * Instantiate appropriate handler.
+     */
+    public static function getInstance(#[\SensitiveParameter] string $key, string $iv): IGE
+    {
+        if (NativeExecutor::get()) {
+            return new IGENative($key, $iv);
+        }
+        return self::getSyncInstance($key, $iv);
+    }
+
+    /**
+     * Instantiate the fastest handler that never suspends.
+     */
+    public static function getSyncInstance(#[\SensitiveParameter] string $key, string $iv): IGE
+    {
+        if (Crypt::native()) {
+            return new IGENativeSync($key, $iv);
+        }
+        if (IGEFFI::isAvailable()) {
+            return new IGEFFI($key, $iv);
+        }
+        if (Magic::$hasOpenssl) {
+            return new IGEOpenssl($key, $iv);
+        }
+        return new IGEPhp($key, $iv);
+    }
+
+    /**
+     * Get the current chaining state.
+     *
+     * Passing it as the IV of a new instance with the same key continues the chain from this point.
+     *
+     * @psalm-mutation-free
+     */
+    public function getState(): string
+    {
+        return $this->iv_part_1.$this->iv_part_2;
+    }
+
+    /** @psalm-impure */
+    abstract protected function __construct(#[\SensitiveParameter] string $key, string $iv);
+    /** @psalm-impure */
+    abstract public function encrypt(string $plaintext): string;
+    /** @psalm-impure */
+    abstract public function decrypt(string $ciphertext): string;
+}

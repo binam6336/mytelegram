@@ -1,0 +1,84 @@
+name: TURN TESTS
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The tests run against a real Coturn server. Coturn is a Unix daemon with
+        # no Chocolatey package or Windows build, so Windows is excluded.
+        os: [ubuntu-latest, macos-latest]
+        php: ["8.2", "8.3", "8.4", "8.5"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP ${{ matrix.php }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          tools: composer:v2
+
+      - name: Validate composer.json and composer.lock
+        run: composer validate --strict
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-progress
+
+      - name: Install Coturn (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y coturn
+          # Stop any auto-started Coturn service first.
+          sudo systemctl stop coturn || true
+
+      - name: Install Coturn (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install coturn
+
+      - name: Start Coturn
+        shell: bash
+        run: |
+          set -x
+          # Build a writable Coturn config pointing at the repo's own certs.
+          mkdir -p /tmp/turnserver
+          sed -e "s|^cert=.*|cert=$(pwd)/tests/turnconfig/turnserver.crt|" \
+              -e "s|^pkey=.*|pkey=$(pwd)/tests/turnconfig/turnserver.key|" \
+              -e "s|^log-file=.*|log-file=/tmp/turnserver/turnserver.log|" \
+              tests/turnconfig/turnserver.conf > /tmp/turnserver/turnserver.conf
+          touch /tmp/turnserver/turnserver.log
+
+          turnserver -c /tmp/turnserver/turnserver.conf -v > /tmp/turnserver/turnserver.out 2>&1 &
+          TURN_PID=$!
+
+          # Wait for the server to open its listening ports. `ss` and `netstat -p`
+          # are Linux-only, so use lsof (preinstalled on both runners) to stay
+          # cross-platform.
+          for i in $(seq 1 30); do
+            if lsof -nP -i 2>/dev/null | grep -E ':(3478|5349) ' >/dev/null; then
+              echo "Coturn is up (pid $TURN_PID)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Coturn failed to start:"
+          cat /tmp/turnserver/turnserver.out
+          exit 1
+
+      - name: Run Psalm
+        run: vendor/bin/psalm --no-progress
+
+      - name: Run PHPUnit tests
+        run: vendor/bin/phpunit

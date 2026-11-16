@@ -1,0 +1,56 @@
+# Stats Library for PHP WebRTC
+
+[![PHP Version](https://img.shields.io/badge/php-%3E%3D8.2-blue.svg)](https://php.net/)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+A PHP implementation of the WebRTC Statistics API for tracking  RTP, DTLS, and media performance metrics.
+
+## About this fork
+
+This is the `danog/php-rtc-stats` PHP 8.2+ fork used by MadelineProto. It is published under the `danog/php-rtc-stats` Composer package name.
+
+All internal Composer dependencies use their `danog/php-rtc-*` package names directly, so installing a component selects the maintained danog packages throughout the dependency graph.
+
+##  Features
+
+- Collect real-time stats from WebRTC components
+- Export stats as structured PHP arrays
+- Supports timing, packet counters, jitter, and loss metrics
+- Designed to match W3C Stats specification
+
+## Requirements
+
+- PHP ≥ 8.2
+
+## Documentation
+
+This package is part of the PHP WebRTC library. For complete documentation, examples, and API reference, visit:
+
+[PHP WebRTC Documentation](https://github.com/danog/php-rtc-stats)
+
+## Credits
+
+### Authors
+
+- **Daniil Gentili**  
+  - Website: [daniil.it](https://daniil.it)
+  - GitHub: [danog](https://github.com/danog)
+
+- **Amin Yazdanpanah**  
+  - Website: [aminyazdanpanah.com](https://www.aminyazdanpanah.com)
+  - Email: [github@aminyazdanpanah.com](mailto:github@aminyazdanpanah.com)
+
+- **Sana Moniri**  
+  - GtiHub: [sanamoniri](https://github.com/sanamoniri)
+
+## Reporting Issues
+
+Found a bug? Please report it on our [issues](https://github.com/php-webrtc/stats/issues).
+
+## License
+
+BSD 3-Clause License. See [LICENSE](LICENSE) for details.
+
+## References
+
+- [W3C WebRTC Statistics API](https://www.w3.org/TR/webrtc-stats/)

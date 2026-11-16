@@ -1,0 +1,303 @@
+<?php declare(strict_types=1);
+
+/**
+ * This file is part of MadelineProto.
+ * MadelineProto is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+ * MadelineProto is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU Affero General Public License for more details.
+ * You should have received a copy of the GNU General Public License along with MadelineProto.
+ * If not, see <http://www.gnu.org/licenses/>.
+ *
+ * @author    Daniil Gentili <daniil@daniil.it>
+ * @copyright 2016-2025 Daniil Gentili <daniil@daniil.it>
+ * @license   https://opensource.org/licenses/AGPL-3.0 AGPLv3
+ * @link https://docs.madelineproto.xyz MadelineProto documentation
+ */
+
+namespace danog\MadelineProto\Ipc;
+
+use Amp\ByteStream\ReadableStream as ByteStreamReadableStream;
+use Amp\ByteStream\WritableStream as ByteStreamWritableStream;
+use Amp\Cancellation;
+use Amp\CancelledException;
+use Amp\Ipc\Sync\ChannelException;
+use Amp\Ipc\Sync\ChannelledSocket;
+use danog\MadelineProto\FileCallback as MadelineProtoFileCallback;
+use danog\MadelineProto\FileCallbackInterface;
+use danog\MadelineProto\Ipc\Wrapper\Cancellation as WrapperCancellation;
+use danog\MadelineProto\Ipc\Wrapper\CancellationReference;
+use danog\MadelineProto\Ipc\Wrapper\FileCallback;
+use danog\MadelineProto\Ipc\Wrapper\Obj;
+use danog\MadelineProto\Ipc\Wrapper\ReadableStream;
+use danog\MadelineProto\Ipc\Wrapper\SeekableReadableStream;
+use danog\MadelineProto\Ipc\Wrapper\SeekableWritableStream;
+use danog\MadelineProto\Ipc\Wrapper\WrappedCancellation;
+use danog\MadelineProto\Ipc\Wrapper\WritableStream;
+use danog\MadelineProto\Logger;
+use danog\MadelineProto\SessionPaths;
+use Revolt\EventLoop;
+use Throwable;
+
+use function Amp\Ipc\connect;
+
+/**
+ * Callback payload wrapper.
+ *
+ * @psalm-suppress InternalMethod
+ * @psalm-suppress InternalClass
+ *
+ * @internal
+ */
+final class Wrapper extends ClientAbstract
+{
+    /**
+     * Payload data.
+     */
+    private mixed $data;
+    /**
+     * Callbacks.
+     *
+     * @var array<callable>
+     */
+    private array $callbacks = [];
+    /**
+     * Wrapped cancellations, stopped when the connection is closed.
+     *
+     * @var list<WrappedCancellation>
+     */
+    private array $cancellations = [];
+    /**
+     * Whether the callback connection was closed.
+     */
+    private bool $disconnected = false;
+    /**
+     * Callbacks IDs.
+     *
+     * @var list<int|list{class-string<Obj>, array<string, int>}>
+     */
+    private array $callbackIds = [];
+    /**
+     * Callback ID.
+     */
+    private int $id = 0;
+    /**
+     * Remote socket ID.
+     */
+    private int $remoteId = 0;
+    /**
+     * Constructor.
+     *
+     * @param mixed $data Payload data
+     */
+    public static function create(mixed &$data, SessionPaths $session, Logger $logger): self
+    {
+        $instance = new self;
+        $instance->data = &$data;
+        $instance->logger = $logger;
+        $instance->run = false;
+
+        $logger->logger('Connecting to callback IPC server...');
+        $instance->server = connect($session->getIpcCallbackPath());
+        $logger->logger('Connected to callback IPC server!');
+
+        $instance->remoteId = $instance->server->receive();
+        $logger->logger("Got ID {$instance->remoteId} from callback IPC server!");
+
+        EventLoop::queue($instance->receiverLoop(...));
+        return $instance;
+    }
+    /**
+     * Serialization function.
+     *
+     * @psalm-pure
+     */
+    public function __sleep(): array
+    {
+        return ['data', 'callbackIds', 'remoteId'];
+    }
+    /**
+     * Wrap a certain callback object.
+     *
+     * @param mixed $callback    Callback to wrap
+     * @param bool  $wrapObjects Whether to wrap object methods, too
+     */
+    public function wrap(mixed &$callback, bool $wrapObjects = true): void
+    {
+        if (\is_object($callback) && $wrapObjects) {
+            if ($callback instanceof Cancellation) {
+                if ($callback->isRequested()) {
+                    // The IPC server only learns about cancellations asynchronously: don't even start the call.
+                    $this->disconnect();
+                    $callback->throwIfRequested();
+                }
+                $callback = new WrappedCancellation($callback);
+                $this->cancellations[] = $callback;
+            }
+            if ($callback instanceof FileCallbackInterface) {
+                $file = $callback->getFile();
+                if ($file instanceof ByteStreamReadableStream) {
+                    $this->wrap($file, true);
+                    $callback = new MadelineProtoFileCallback($file, $callback);
+                }
+            }
+            $ids = [];
+            foreach (get_class_methods($callback) as $method) {
+                $id = $this->id++;
+                $this->callbacks[$id] = [$callback, $method];
+                $ids[$method] = $id;
+            }
+            $class = null;
+            if ($callback instanceof ByteStreamReadableStream) {
+                $class = method_exists($callback, 'seek') ? SeekableReadableStream::class : ReadableStream::class;
+            } elseif ($callback instanceof ByteStreamWritableStream) {
+                $class = method_exists($callback, 'seek') ? SeekableWritableStream::class : WritableStream::class;
+            } elseif ($callback instanceof FileCallbackInterface) {
+                $class = FileCallback::class;
+            } elseif ($callback instanceof WrappedCancellation) {
+                $class = WrapperCancellation::class;
+            }
+            if (!$class) {
+                return;
+            }
+            $callback = [$class, $ids]; // Will be re-filled later
+            $this->callbackIds[] = &$callback;
+        } elseif (\is_callable($callback)) {
+            $id = $this->id++;
+            $this->callbacks[$id] = self::copy($callback);
+            $callback = $id;
+            $this->callbackIds[] = &$callback;
+        }
+    }
+    /**
+     * Get copy of data.
+     *
+     * @psalm-pure
+     */
+    private static function copy($data)
+    {
+        return $data;
+    }
+    /**
+     * Receiver loop.
+     */
+    private function receiverLoop(): void
+    {
+        $id = 0;
+        $payload = null;
+        try {
+            while ($payload = $this->server->receive()) {
+                EventLoop::queue($this->clientRequest(...), $id++, $payload);
+            }
+        } finally {
+            $this->disconnected = true;
+            foreach ($this->cancellations as $cancellation) {
+                $cancellation->disconnect();
+            }
+            EventLoop::queue($this->server->disconnect(...), "exiting receiverLoop");
+        }
+    }
+
+    /**
+     * Handle client request.
+     *
+     * @param integer $id      Request ID
+     * @param array   $payload Payload
+     */
+    private function clientRequest(int $id, array $payload): void
+    {
+        try {
+            /** @var list<mixed> */
+            $args = $payload[1];
+            /** @var mixed $arg */
+            foreach ($args as &$arg) {
+                if ($arg instanceof CancellationReference) {
+                    $callback = $this->callbacks[$arg->id] ?? null;
+                    $arg = \is_array($callback) && $callback[0] instanceof WrappedCancellation
+                        ? $callback[0]->getCancellation()
+                        : null;
+                }
+            }
+            unset($arg);
+            $result = $this->callbacks[$payload[0]](...$args);
+        } catch (CancelledException $e) {
+            $result = new ExitFailure($e);
+        } catch (Throwable $e) {
+            $this->logger->logger("Got error while calling reverse IPC method: $e", Logger::ERROR);
+            $result = new ExitFailure($e);
+        }
+        if ($this->disconnected) {
+            return;
+        }
+        try {
+            $this->server->send([$id, $result]);
+        } catch (ChannelException $e) {
+            // The server closed the connection, as it does once the IPC call of the callbacks returned (the late
+            // progress notifications of an upload, for example), before receiverLoop() got to see it (receive()
+            // closes the socket, then sends the close request): nobody waits for the result anymore, see
+            // ClientAbstract::loopInternal().
+            $this->disconnected = true;
+            $this->logger->logger("Not sending the result of reverse method {$payload[0]}, the connection was closed: $e", Logger::VERBOSE);
+        } catch (Throwable $e) {
+            $this->logger->logger("Got error while trying to send result of reverse method {$payload[0]}: $e", Logger::ERROR);
+            try {
+                $this->server->send([$id, new ExitFailure($e)]);
+            } catch (Throwable $e) {
+                $this->logger->logger("Got error while trying to send error of error of reverse method {$payload[0]}: $e", Logger::ERROR);
+            }
+        }
+    }
+    /**
+     * Call a callback of the client.
+     *
+     * @param string|int    $function  Callback ID
+     * @param array|Wrapper $arguments Arguments
+     */
+    #[\Override]
+    public function __call(string|int $function, array|Wrapper $arguments)
+    {
+        if (\is_array($arguments)) {
+            /** @var mixed $argument */
+            foreach ($arguments as &$argument) {
+                if ($argument instanceof WrapperCancellation) {
+                    // Proxies of the client's cancellations can't be serialized:
+                    // the client resolves the reference to the original cancellation.
+                    $argument = $argument->getReference();
+                }
+            }
+            unset($argument);
+        }
+        return parent::__call($function, $arguments);
+    }
+
+    /**
+     * Get remote socket ID.
+     *
+     * @internal
+     */
+    public function getRemoteId(): int
+    {
+        return $this->remoteId;
+    }
+
+    /**
+     * Set socket and unwrap data.
+     *
+     * @param ChannelledSocket $server Socket.
+     * @internal
+     */
+    public function unwrap(ChannelledSocket $server)
+    {
+        $this->server = $server;
+        EventLoop::queue($this->loopInternal(...));
+
+        foreach ($this->callbackIds as &$id) {
+            if (\is_int($id)) {
+                $id = fn (...$args) => $this->__call($id, $args);
+            } else {
+                [$class, $ids] = $id;
+                $id = new $class($this, $ids);
+            }
+        }
+        return $this->data;
+    }
+}

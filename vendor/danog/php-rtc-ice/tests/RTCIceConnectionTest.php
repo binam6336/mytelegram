@@ -1,0 +1,1858 @@
+<?php
+
+namespace Tests\Webrtc\ICE;
+
+use Amp\Socket\InternetAddress;
+use Mockery;
+use PHPUnit\Framework\Attributes\AllowMockObjectsWithoutExpectations;
+use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\UsesClass;
+use PHPUnit\Framework\Attributes\UsesTrait;
+use PHPUnit\Framework\TestCase;
+use Random\RandomException;
+use ReflectionMethod;
+use Webrtc\Exception\InvalidArgumentException;
+use Webrtc\Exception\RuntimeException;
+use Webrtc\ICE\Enum\CandidateType;
+use Webrtc\ICE\Enum\IceRole;
+use Webrtc\ICE\Enum\RTCIceCandidatePairStats;
+use Webrtc\ICE\Enum\TransportPolicyType;
+use Webrtc\ICE\Enum\TransportType;
+use Webrtc\ICE\Listener\IceConnectionDataListener;
+use Webrtc\ICE\RTCIceCandidate;
+use Webrtc\ICE\RTCIceCandidatePair;
+use Webrtc\ICE\RTCIceConnection;
+use Webrtc\ICE\RTCIceProtocolConfiguration;
+use Webrtc\ICE\Utils;
+use Webrtc\STUN\Enum\MessageAttribute;
+use Webrtc\STUN\Enum\MessageClass;
+use Webrtc\STUN\Enum\MessageMethod;
+use Webrtc\STUN\Exception\TransactionExceptionInterface;
+use Webrtc\STUN\Exception\TransactionTimeoutException;
+use Webrtc\STUN\IceConnectionProtocolInterface;
+use Webrtc\STUN\Message\Message;
+use Webrtc\STUN\Message\MessageInterface;
+use Webrtc\STUN\StunInterface;
+use Webrtc\STUN\Trait\Request;
+use function Amp\async;
+use function Amp\delay;
+use function Amp\Future\await;
+
+#[UsesClass(RTCIceProtocolConfiguration::class)]
+#[UsesClass(Utils::class)]
+#[UsesClass(RTCIceCandidate::class)]
+#[UsesClass(RTCIceCandidatePair::class)]
+#[CoversClass(RTCIceConnection::class)]
+class RTCIceConnectionTest extends TestCase
+{
+    /** @var resource|null */
+    private static mixed $turnServerProcess = null;
+    private static ?string $turnServerLog = null;
+    private static ?string $turnServerBinaryBuilt = null;
+    private static ?string $turnServerUnavailableReason = null;
+
+    private RTCIceProtocolConfiguration $config;
+
+    public static function setUpBeforeClass(): void
+    {
+        parent::setUpBeforeClass();
+
+        if (self::turnServerIsReady()) {
+            return;
+        }
+
+        $binary = self::turnServerBinary();
+        if ($binary === null) {
+            self::$turnServerUnavailableReason =
+                'The pion/turn test server is unavailable (set PHP_RTC_TURN_BINARY, or install the Go toolchain so it can be built).';
+            return;
+        }
+
+        $turnServerLog = tempnam(sys_get_temp_dir(), 'php-rtc-turn-log-');
+        if ($turnServerLog === false) {
+            throw new \RuntimeException('Could not create the temporary TURN server log file.');
+        }
+        self::$turnServerLog = $turnServerLog;
+
+        // The pion/turn server takes no configuration: it listens on 127.0.0.1:3478 (UDP and TCP)
+        // with the long-term credentials the tests use, and writes any diagnostics to stderr.
+        self::$turnServerProcess = proc_open(
+            [$binary],
+            [
+                0 => ['pipe', 'r'],
+                1 => ['file', self::$turnServerLog, 'a'],
+                2 => ['file', self::$turnServerLog, 'a'],
+            ],
+            $pipes,
+            dirname(__DIR__),
+        );
+        if (!is_resource(self::$turnServerProcess)) {
+            self::removeTurnServerFiles();
+            throw new \RuntimeException('Could not start the pion/turn test server.');
+        }
+
+        fclose($pipes[0]);
+
+        $deadline = microtime(true) + 30;
+        do {
+            if (self::turnServerIsReady()) {
+                return;
+            }
+
+            $status = proc_get_status(self::$turnServerProcess);
+            if (!$status['running']) {
+                break;
+            }
+
+            usleep(50_000);
+        } while (microtime(true) < $deadline);
+
+        $log = self::$turnServerLog === null ? '' : (string) @file_get_contents(self::$turnServerLog);
+        self::stopTurnServer();
+        throw new \RuntimeException("The pion/turn test server did not become ready.\n" . $log);
+    }
+
+    public static function tearDownAfterClass(): void
+    {
+        self::stopTurnServer();
+        parent::tearDownAfterClass();
+    }
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        $this->config = new RTCIceProtocolConfiguration();
+        $this->config->setStunServer([]);
+    }
+
+    protected function tearDown(): void
+    {
+
+    }
+
+    #[AllowMockObjectsWithoutExpectations]
+    public function testGetHostAddresses()
+    {
+        $connectionMock = $this->getMockBuilder(RTCIceConnection::class)
+            ->setConstructorArgs([$this->config])
+            ->onlyMethods(['getInterfaces'])
+            ->getMock();
+
+        $connectionMock->method('getInterfaces')
+            ->willReturn(
+                [
+                    [
+                        'unicast' => [
+                            ['address' => '1.2.3.4'],
+                            ['address' => '2a02:0db8:85a3:0000:0000:8a2e:0370:7334']
+                        ]
+                    ]
+                ]
+            );
+
+        // IPv4 only
+        $addresses = $connectionMock->getHostAddresses(true, false);
+        $this->assertEquals(['1.2.3.4'], $addresses);
+
+        // IPv6 only
+        $addresses = $connectionMock->getHostAddresses(false, true);
+        $this->assertEquals(['[2a02:0db8:85a3:0000:0000:8a2e:0370:7334]'], $addresses);
+
+        // Both
+        $addresses = $connectionMock->getHostAddresses(true, true);
+        $this->assertEquals(['1.2.3.4', '[2a02:0db8:85a3:0000:0000:8a2e:0370:7334]'], $addresses);
+    }
+
+    public function testClose()
+    {
+        $connection = $this->iceConnection();
+        $this->assertFalse($connection->isClosed());
+
+        // Close
+        $connection->close();
+        $this->assertTrue($connection->isClosed());
+    }
+
+    public function testStateSavedByAnOlderVersionCanBeRestored()
+    {
+        // Saved by a version that still had $consentFailureCount, since removed.
+        $state = (new RTCIceConnection($this->config, IceRole::Controlling))->__serialize();
+        $state[RTCIceConnection::class . "\0consentFailureCount"] = 3;
+
+        $restored = (new \ReflectionClass(RTCIceConnection::class))->newInstanceWithoutConstructor();
+        $restored->__unserialize($state);
+        $this->assertFalse($restored->isClosed());
+    }
+
+    public function testTheHighestPriorityNominatedPairIsUsed()
+    {
+        $connection = new RTCIceConnection($this->config, IceRole::Controlling);
+        $makePair = function (int $localPriority, int $remotePriority): RTCIceCandidatePair {
+            $local = new RTCIceCandidate(1);
+            $local->setPriority($localPriority);
+            $protocol = Mockery::mock(IceConnectionProtocolInterface::class);
+            $protocol->allows('getCandidate')->andReturn($local);
+            $protocol->allows('getId')->andReturn(uniqid());
+            $remote = new RTCIceCandidate(1);
+            $remote->setPriority($remotePriority);
+            $pair = new RTCIceCandidatePair($protocol, $remote);
+            $pair->setNominated(true);
+            $pair->setState(RTCIceCandidatePairStats::SUCCEEDED);
+            return $pair;
+        };
+        // A host pair, and a pair with a relayed local candidate.
+        $high = $makePair(2130706431, 2130706431);
+        $low = $makePair(16777215, 2130706431);
+
+        // Checks run in parallel: the lower-priority pair can be nominated last.
+        $handle = new ReflectionMethod(RTCIceConnection::class, 'handleSuccessfulPair');
+        $handle->invoke($connection, $high);
+        $handle->invoke($connection, $low);
+
+        $nominated = (new \ReflectionProperty(RTCIceConnection::class, 'nominated'))->getValue($connection);
+        $this->assertSame($high, $nominated[1]);
+    }
+
+    public function testConnect()
+    {
+        $connection1 = $this->getIceConnection();
+        $connection2 = $this->getIceConnection(false);
+
+        $this->inviteAccept($connection1, $connection2);
+
+        $this->assertCandidateTypes($connection1, ['host']);
+        $this->assertCandidateTypes($connection2, ['host']);
+
+        $data1 = [];
+        $data2 = [];
+        $this->getData($connection1, $data1);
+        $this->getData($connection2, $data2);
+
+        $candidate = $connection1->getDefaultCandidate(1);
+        $this->assertNotNull($candidate);
+        $this->assertEquals('host', $candidate->getType()->name);
+
+        $candidate = $connection1->getDefaultCandidate(2);
+        $this->assertNull($candidate);
+
+        $this->asyncConnect($connection1, $connection2);
+
+        $connection1->sendData('Hello');
+        delay(.1);
+        $this->assertEquals('Hello', $data2[0][0]);
+
+        $connection2->sendData('Bye');
+        delay(.01);
+        $this->assertEquals('Bye', $data1[0][0]);
+
+        $connection1->close();
+        $connection2->close();
+    }
+
+
+    public function testConnectEarlyChecks()
+    {
+        $connection1 = $this->getIceConnection();
+        $connection2 = $this->getIceConnection(false);
+
+        $this->inviteAccept($connection1, $connection2);
+
+        $data1 = [];
+        $data2 = [];
+        $this->getData($connection1, $data1);
+        $this->getData($connection2, $data2);
+
+        // Connection 1 starts checking first, so its Binding requests arrive on
+        // connection 2 as early checks. Application data is unreliable UDP with no
+        // retransmission, so ICE has to finish on both agents before the single
+        // datagram is sent, otherwise it is dropped on a cold path (which happens on
+        // the macOS runner, though loopback on Linux buffers it and hides the race).
+        $connect1 = async(fn() => $connection1->connect());
+        delay(1);
+        $connect2 = async(fn() => $connection2->connect());
+        await([$connect1, $connect2]);
+
+        $connection1->sendData('Hello');
+        $this->waitForData($data2);
+        $this->assertEquals('Hello', $data2[0][0]);
+
+        $connection2->sendData('Bye');
+        $this->waitForData($data1);
+        $this->assertEquals('Bye', $data1[0][0]);
+
+        $connection1->close();
+        $connection2->close();
+    }
+
+    /**
+     *  The sequence is:
+     *  - Connection 1 starts connecting immediately, but has no candidates
+     *  - Connection 2 receives candidates and connects
+     *  - Connection 1 receives candidates, and connection completes
+     *
+     * @return void
+     * @throws RandomException
+     * @throws \Throwable
+     */
+    public function testConnectEarlyChecks2()
+    {
+        $connection1 = $this->getIceConnection();
+        $connection2 = $this->getIceConnection(false);
+
+        $connection1->gatherCandidates();
+        $connection2->gatherCandidates();
+
+        $connection1->setRemoteUsername($connection2->getLocalUsername());
+        $connection1->setRemotePassword($connection2->getLocalPassword());
+        $connection2->setRemoteUsername($connection1->getLocalUsername());
+        $connection2->setRemotePassword($connection1->getLocalPassword());
+
+        $data1 = [];
+        $data2 = [];
+        $this->getData($connection1, $data1);
+        $this->getData($connection2, $data2);
+
+        async(fn() => $connection1->connect())->ignore();
+
+        foreach ($connection1->getLocalCandidates() as $candidate) {
+            $connection2->addRemoteCandidate($candidate);
+        }
+        async(fn() => $connection2->connect())->ignore();
+
+
+        foreach ($connection2->getLocalCandidates() as $candidate) {
+            $connection1->addRemoteCandidate($candidate);
+        }
+
+        delay(.1);
+
+        $connection1->sendData('Hello');
+        delay(.01);
+        $this->assertEquals('Hello', $data2[0][0]);
+
+        $connection2->sendData('Bye');
+        delay(.01);
+        $this->assertEquals('Bye', $data1[0][0]);
+
+        $connection1->close();
+        $connection2->close();
+    }
+
+    public function testConnectTwoComponents()
+    {
+        $connection1 = $this->getIceConnection();
+        $connection2 = $this->getIceConnection(false);
+
+        $connection1->setComponentIds(range(1, 2));
+        $connection2->setComponentIds(range(1, 2));
+
+        $this->inviteAccept($connection1, $connection2);
+
+        $this->assertCandidateTypes($connection1, ['host']);
+        $this->assertCandidateTypes($connection2, ['host']);
+
+        $data1 = [];
+        $data2 = [];
+        $this->getData($connection1, $data1);
+        $this->getData($connection2, $data2);
+
+        $candidate = $connection1->getDefaultCandidate(1);
+        $this->assertNotNull($candidate);
+        $this->assertEquals('host', $candidate->getType()->name);
+
+        $candidate = $connection1->getDefaultCandidate(2);
+        $this->assertNotNull($candidate);
+
+        $this->asyncConnect($connection1, $connection2);
+
+        $this->assertEquals([1, 2], $connection1->getComponentIds());
+        $this->assertEquals([1, 2], $connection2->getComponentIds());
+
+        $connection1->sendData('Hello 1');
+        delay(.01);
+        $this->assertEquals('Hello 1', $data2[0][0]);
+        $this->assertEquals(1, $data2[0][1]);
+
+        $connection2->sendData('Bye 1');
+        delay(.01);
+        $this->assertEquals('Bye 1', $data1[0][0]);
+        $this->assertEquals(1, $data1[0][1]);
+
+        $connection1->sendData('Hello 2', 2);
+        delay(.01);
+        $this->assertEquals('Hello 2', $data2[1][0]);
+        $this->assertEquals(2, $data2[1][1]);
+
+        $connection2->sendData('Bye 2', 2);
+        delay(.01);
+        $this->assertEquals('Bye 2', $data1[1][0]);
+        $this->assertEquals(2, $data1[1][1]);
+
+        $connection1->close();
+        $connection2->close();
+    }
+
+    public function testConnectTwoComponentsVsOneComponent()
+    {
+        $connection1 = $this->getIceConnection();
+        $connection2 = $this->getIceConnection(false);
+
+        $connection1->setComponentIds(range(1, 2));
+
+        $this->inviteAccept($connection1, $connection2);
+
+        $this->assertCandidateTypes($connection1, ['host']);
+        $this->assertCandidateTypes($connection2, ['host']);
+
+        $data1 = [];
+        $data2 = [];
+        $this->getData($connection1, $data1);
+        $this->getData($connection2, $data2);
+
+        $candidate = $connection1->getDefaultCandidate(1);
+        $this->assertNotNull($candidate);
+        $this->assertEquals('host', $candidate->getType()->name);
+
+        $candidate = $connection1->getDefaultCandidate(2);
+        $this->assertNotNull($candidate);
+
+        $this->asyncConnect($connection1, $connection2);
+
+        $this->assertEquals([1], $connection1->getComponentIds());
+        $this->assertEquals([1], $connection2->getComponentIds());
+
+        $connection1->sendData('Hello');
+        delay(.01);
+        $this->assertEquals('Hello', $data2[0][0]);
+        $this->assertEquals(1, $data2[0][1]);
+
+        $connection2->sendData('Bye');
+        delay(.01);
+        $this->assertEquals('Bye', $data1[0][0]);
+
+        $connection1->close();
+        $connection2->close();
+    }
+
+    public function testConnectToIceLite()
+    {
+        $connection1 = $this->getIceConnection();
+        $connection1->setRemoteIsLite(true);
+        $connection2 = $this->getIceConnection(false);
+
+        $this->inviteAccept($connection1, $connection2);
+
+        $this->assertCandidateTypes($connection1, ['host']);
+        $this->assertCandidateTypes($connection2, ['host']);
+
+        $candidate = $connection1->getDefaultCandidate(1);
+        $this->assertNotNull($candidate);
+        $this->assertEquals('host', $candidate->getType()->name);
+
+        $data1 = [];
+        $data2 = [];
+        $this->getData($connection1, $data1);
+        $this->getData($connection2, $data2);
+
+        $candidate = $connection1->getDefaultCandidate(2);
+        $this->assertNull($candidate);
+
+        $this->asyncConnect($connection1, $connection2);
+
+        $connection1->sendData('Hello');
+        delay(.01);
+        $this->assertEquals('Hello', $data2[0][0]);
+
+        $connection2->sendData('Bye');
+        delay(.01);
+        $this->assertEquals('Bye', $data1[0][0]);
+
+        $connection1->close();
+        $connection2->close();
+    }
+
+    #[AllowMockObjectsWithoutExpectations]
+    public function testConnectToIceLiteNominationFails()
+    {
+        $connection1 = $this->getIceConnection();
+        $connection1->setRemoteIsLite(true);
+        $connection2 = $this->getMockBuilder(RTCIceConnection::class)
+            ->setConstructorArgs([$this->config])
+            ->onlyMethods(['onRequestReceived'])
+            ->getMock();
+
+        $onRequestReceivedMock = function (MessageInterface $message, InternetAddress $address, IceConnectionProtocolInterface $protocol, string $data) use ($connection2) {
+            if ($message->attributes()->has(MessageAttribute::USE_CANDIDATE)) {
+                $connection2->respondError($message, $address, $protocol, [500, 'Internal Error']);
+            } else {
+                $refMethod = new ReflectionMethod(RTCIceConnection::class, 'onRequestReceived');
+                $refMethod->invoke($connection2, $message, $address, $protocol, $data);
+            }
+        };
+        $connection2->method('onRequestReceived')->willReturnCallback($onRequestReceivedMock);
+
+        $this->inviteAccept($connection1, $connection2);
+
+        async(function () use ($connection1, $connection2) {
+            delay(5);
+            $connection1->close();
+            $connection2->close();
+        })->ignore();
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('ICE negotiation failed');
+        $this->asyncConnect($connection1, $connection2);
+    }
+
+    public function testConnectIpv6()
+    {
+        if (!$this->isSupportIPv6()) {
+            $this->markTestSkipped('This host has no usable IPv6.');
+        }
+
+        $connection1 = $this->getIceConnection();
+        $connection2 = $this->getIceConnection(false);
+        $connection1->setUseIPv4(false);
+        $connection2->setUseIPv4(false);
+
+        $this->inviteAccept($connection1, $connection2);
+        $this->assertGreaterThan(0, count($connection1->getLocalCandidates()));
+        foreach ($connection1->getLocalCandidates() as $candidate) {
+            $this->assertEquals('host', $candidate->getType()->name);
+        }
+
+        $data1 = [];
+        $data2 = [];
+        $this->getData($connection1, $data1);
+        $this->getData($connection2, $data2);
+
+        $this->asyncConnect($connection1, $connection2);
+
+        $connection1->sendData('Hello');
+        delay(.01);
+        $this->assertEquals('Hello', $data2[0][0]);
+
+        $connection2->sendData('Bye');
+        delay(.01);
+        $this->assertEquals('Bye', $data1[0][0]);
+
+        $connection1->close();
+        $connection2->close();
+    }
+
+    public function testConnectReverseOrder()
+    {
+        $connection1 = $this->getIceConnection();
+        $connection2 = $this->getIceConnection(false);
+
+        $this->inviteAccept($connection1, $connection2);
+
+        async(function () use ($connection1) {
+            delay(1);
+            async(fn() => $connection1->connect())->ignore();
+        })->ignore();
+        async(fn() => $connection2->connect())->ignore();
+
+        delay(2);
+
+        $data1 = [];
+        $data2 = [];
+        $this->getData($connection1, $data1);
+        $this->getData($connection2, $data2);
+
+        $connection1->sendData('Hello');
+        delay(.01);
+        $this->assertEquals('Hello', $data2[0][0]);
+
+        $connection2->sendData('Bye');
+        delay(.01);
+        $this->assertEquals('Bye', $data1[0][0]);
+
+        $connection1->close();
+        $connection2->close();
+    }
+
+    public function testConnectInvalidPassword()
+    {
+        $connection1 = $this->getIceConnection();
+        $connection2 = $this->getIceConnection(false);
+
+        $connection1->gatherCandidates();
+        foreach ($connection1->getLocalCandidates() as $candidate) {
+            $connection2->addRemoteCandidate($candidate);
+        }
+        $connection2->endOfRemoteCandidate();
+        $connection2->setRemoteUsername($connection1->getLocalUsername());
+        $connection2->setRemotePassword($connection1->getLocalPassword());
+
+        $connection2->gatherCandidates();
+        foreach ($connection2->getLocalCandidates() as $candidate) {
+            $connection1->addRemoteCandidate($candidate);
+        }
+        $connection1->endOfRemoteCandidate();
+        $connection1->setRemoteUsername($connection2->getLocalUsername());
+        $connection1->setRemotePassword('wrong-password');
+
+        async(function () use ($connection1, $connection2) {
+            delay(1);
+            $connection1->close();
+            $connection2->close();
+        })->ignore();
+
+        $this->expectException(RuntimeException::class);
+        $this->asyncConnect($connection1, $connection2);
+    }
+
+    public function testConnectInvalidUsername()
+    {
+        $connection1 = $this->getIceConnection();
+        $connection2 = $this->getIceConnection(false);
+
+        $connection1->gatherCandidates();
+        foreach ($connection1->getLocalCandidates() as $candidate) {
+            $connection2->addRemoteCandidate($candidate);
+        }
+        $connection2->endOfRemoteCandidate();
+        $connection2->setRemoteUsername($connection1->getLocalUsername());
+        $connection2->setRemotePassword($connection1->getLocalPassword());
+
+        $connection2->gatherCandidates();
+        foreach ($connection2->getLocalCandidates() as $candidate) {
+            $connection1->addRemoteCandidate($candidate);
+        }
+        $connection1->endOfRemoteCandidate();
+        $connection1->setRemoteUsername('wrong-username');
+        $connection1->setRemotePassword($connection2->getLocalPassword());
+
+        async(function () use ($connection1, $connection2) {
+            delay(1);
+            $connection1->close();
+            $connection2->close();
+        })->ignore();
+
+        $this->expectException(RuntimeException::class);
+        $this->asyncConnect($connection1, $connection2);
+    }
+
+    public function testConnectNoGather()
+    {
+        $connection = $this->getIceConnection();
+        $connection->addRemoteCandidate(RTCIceCandidate::parseSDP('6815297761 1 udp 659136 1.2.3.4 31102 typ host generation 0'));
+        $connection->endOfRemoteCandidate();
+        $connection->setRemoteUsername('foo');
+        $connection->setRemotePassword('bar');
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Local candidates gathering was not performed');
+        $connection->connect();
+
+        $connection->close();
+    }
+
+    public function testConnectNoLocalCandidates()
+    {
+        $connection = $this->getIceConnection();
+        $connection->setRemoteCandidatesEnd(true);
+        $this->expectException(InvalidArgumentException::class);
+        $connection->addRemoteCandidate(RTCIceCandidate::parseSDP('6815297761 1 udp 659136 1.2.3.4 31102 typ host generation 0'));
+        $connection->endOfRemoteCandidate();
+        $connection->setRemoteUsername('foo');
+        $connection->setRemotePassword('bar');
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('ICE negotiation failed');
+        $connection->connect();
+
+        $connection->close();
+    }
+
+    public function testConnectNoRemoteCandidates()
+    {
+        $connection = $this->getIceConnection();
+        $connection->gatherCandidates();
+        $connection->endOfRemoteCandidate();
+        $connection->setRemoteUsername('foo');
+        $connection->setRemotePassword('bar');
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('ICE negotiation failed: Binding check failed');
+        $connection->connect();
+
+        $connection->close();
+    }
+
+    public function testConnectNoRemoteCredentials()
+    {
+        $connection = $this->getIceConnection();
+        $connection->gatherCandidates();
+        $connection->addRemoteCandidate(RTCIceCandidate::parseSDP('6815297761 1 udp 659136 1.2.3.4 31102 typ host generation 0'));
+        $connection->endOfRemoteCandidate();
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Remote username or password is missing');
+        $connection->connect();
+
+        $connection->close();
+    }
+
+    public function testConnectRoleConflictBothControlling()
+    {
+        $connection1 = $this->getIceConnection();
+        $connection2 = $this->getIceConnection();
+
+        $connection1->setTieBreaker(1);
+        $connection2->setTieBreaker(2);
+
+        $this->inviteAccept($connection1, $connection2);
+
+        $this->asyncConnect($connection1, $connection2);
+
+        $this->assertFalse($connection1->isControllingRole());
+        $this->assertTrue($connection2->isControllingRole());
+
+        $connection1->close();
+        $connection2->close();
+    }
+
+    public function testConnectRoleConflictBothControlled()
+    {
+        $connection1 = $this->getIceConnection(false);
+        $connection2 = $this->getIceConnection(false);
+
+        $connection1->setTieBreaker(1);
+        $connection2->setTieBreaker(2);
+
+        $this->inviteAccept($connection1, $connection2);
+
+        $this->asyncConnect($connection1, $connection2);
+
+        $this->assertFalse($connection1->isControllingRole());
+        $this->assertTrue($connection2->isControllingRole());
+
+        $connection1->close();
+        $connection2->close();
+    }
+
+    #[AllowMockObjectsWithoutExpectations]
+    public function testConnectTimeout()
+    {
+        $connection = $this->getMockBuilder(RTCIceConnection::class)
+            ->setConstructorArgs([$this->config, IceRole::Controlling])
+            ->onlyMethods(['startCheckBinding'])
+            ->getMock();
+        $startCheckBindingMock = function (RTCIceCandidatePair $pair) use ($connection) {
+            $connection->changeCandidatePairState($pair, RTCIceCandidatePairStats::IN_PROGRESS);
+            $nominate = $connection->isControllingRole();
+            $message = $connection->buildBindingMessage($pair, $nominate);
+            $remoteAddress = $pair->getRemoteAddress();
+
+            // Mirrors the real startCheckBinding(): the request blocks, so it runs in its
+            // own fiber and the check list keeps moving while it is outstanding.
+            async(function () use ($connection, $pair, $message, $remoteAddress, $nominate): void {
+                try {
+                    [, $address] = $pair->getProtocol()->request($message, $remoteAddress, $connection->getRemotePassword(), -1);
+                    $connection->handleCheckBinding($address, $pair, $nominate);
+                } catch (TransactionExceptionInterface $e) {
+                    $connection->handleBindingError($e, $pair, $message);
+                }
+            })->ignore();
+        };
+        $connection->method('startCheckBinding')->willReturnCallback($startCheckBindingMock);
+
+        $connection->gatherCandidates();
+        $connection->addRemoteCandidate(RTCIceCandidate::parseSDP('6815297761 1 udp 659136 1.2.3.4 31102 typ host generation 0'));
+        $connection->setRemoteCandidatesEnd(true);
+        $connection->setRemoteUsername('foo');
+        $connection->setRemotePassword('bar');
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('ICE negotiation failed');
+        $connection->connect();
+
+        $connection->close();
+    }
+
+    public function testConnectWithStunServer()
+    {
+        $this->requireLocalTurnServer();
+
+        $config = clone $this->config;
+        $config->setStunServer([self::localServerHost(), 3478]);
+        $connection1 = $this->iceConnection($config);
+        $connection2 = $this->getIceConnection(false);
+
+        $this->inviteAccept($connection1, $connection2);
+
+        $this->assertCandidateTypes($connection1, ['host', 'srflx']);
+        $this->assertCandidateTypes($connection2, ['host']);
+
+        $candidate = $connection1->getDefaultCandidate(1);
+        $this->assertNotNull($candidate);
+        $this->assertEquals('srflx', $candidate->getType()->name);
+        $this->assertNotNull($candidate->getRelatedAddress());
+        $this->assertNotNull($candidate->getRelatedPort());
+
+        $this->asyncConnect($connection1, $connection2);
+
+        $data1 = [];
+        $data2 = [];
+        $this->getData($connection1, $data1);
+        $this->getData($connection2, $data2);
+
+        $connection1->sendData('Hello');
+        delay(.01);
+        $this->assertEquals('Hello', $data2[0][0]);
+
+        $connection2->sendData('Bye');
+        delay(.01);
+        $this->assertEquals('Bye', $data1[0][0]);
+
+        $connection1->close();
+        $connection2->close();
+    }
+
+    public function testConnectWithStunServerDnsLookupError()
+    {
+        $config = clone $this->config;
+        // RFC 6761: the .invalid TLD is guaranteed not to resolve.
+        $config->setStunServer(['fakestun.invalid', 3478]);
+        $connection1 = $this->iceConnection($config);
+        $connection2 = $this->getIceConnection(false);
+
+        $this->inviteAccept($connection1, $connection2);
+
+        $this->assertCandidateTypes($connection1, ['host']);
+        $this->assertCandidateTypes($connection2, ['host']);
+
+        $this->asyncConnect($connection1, $connection2);
+
+        $data1 = [];
+        $data2 = [];
+        $this->getData($connection1, $data1);
+        $this->getData($connection2, $data2);
+
+        $connection1->sendData('Hello');
+        delay(.01);
+        $this->assertEquals('Hello', $data2[0][0]);
+
+        $connection2->sendData('Bye');
+        delay(.01);
+        $this->assertEquals('Bye', $data1[0][0]);
+
+        $connection1->close();
+        $connection2->close();
+    }
+
+    public function testConnectWithStunServerTimeout()
+    {
+        $config = clone $this->config;
+        $config->setStunServer(['127.0.0.1', self::unusedUdpPort()]);
+        $connection1 = $this->iceConnection($config);
+        $connection2 = $this->getIceConnection(false);
+
+        $this->inviteAccept($connection1, $connection2);
+
+        $this->assertCandidateTypes($connection1, ['host']);
+        $this->assertCandidateTypes($connection2, ['host']);
+
+        $this->asyncConnect($connection1, $connection2);
+
+        $data1 = [];
+        $data2 = [];
+        $this->getData($connection1, $data1);
+        $this->getData($connection2, $data2);
+
+        $connection1->sendData('Hello');
+        delay(.01);
+        $this->assertEquals('Hello', $data2[0][0]);
+
+        $connection2->sendData('Bye');
+        delay(.01);
+        $this->assertEquals('Bye', $data1[0][0]);
+
+        $connection1->close();
+        $connection2->close();
+    }
+
+    public function testConnectWithStunServerIpv6()
+    {
+        if (!$this->isSupportIPv6()) {
+            $this->markTestSkipped('This host has no usable IPv6.');
+        }
+
+        $config = clone $this->config;
+        $config->setStunServer([self::localServerHost(), 3478]);
+        $connection1 = $this->iceConnection($config);
+        $connection2 = $this->getIceConnection(false);
+        $connection1->setUseIPv4(false);
+        $connection2->setUseIPv4(false);
+
+        $this->inviteAccept($connection1, $connection2);
+
+        $this->assertGreaterThan(0, count($connection1->getLocalCandidates()));
+        foreach ($connection1->getRemoteCandidates() as $candidate) {
+            $this->assertEquals('host', $candidate->getType()->name);
+        }
+
+        $this->asyncConnect($connection1, $connection2);
+
+        $data1 = [];
+        $data2 = [];
+        $this->getData($connection1, $data1);
+        $this->getData($connection2, $data2);
+
+        $connection1->sendData('Hello');
+        delay(.01);
+        $this->assertEquals('Hello', $data2[0][0]);
+
+        $connection2->sendData('Bye');
+        delay(.01);
+        $this->assertEquals('Bye', $data1[0][0]);
+
+        $connection1->close();
+        $connection2->close();
+    }
+
+    public function testConnectWithTurnServerTcp()
+    {
+        $this->requireLocalTurnServer();
+
+        $config = clone $this->config;
+        $config->setTurnServer([self::localServerHost(), 3478]);
+        $config->setTurnUsername('quasarstream');
+        $config->setTurnPassword('123');
+        $config->setTurnTransport('tcp');
+        $connection1 = $this->iceConnection($config);
+        $connection2 = $this->getIceConnection(false);
+
+        $this->inviteAccept($connection1, $connection2);
+
+        $this->assertCandidateTypes($connection1, ['host', 'relay']);
+        $this->assertCandidateTypes($connection2, ['host']);
+
+        $candidate = $connection1->getDefaultCandidate(1);
+        $this->assertNotNull($candidate);
+        $this->assertEquals('relay', $candidate->getType()->name);
+        $this->assertNotNull($candidate->getRelatedAddress());
+        $this->assertNotNull($candidate->getRelatedPort());
+
+        $this->asyncConnect($connection1, $connection2);
+
+        $data1 = [];
+        $data2 = [];
+        $this->getData($connection1, $data1);
+        $this->getData($connection2, $data2);
+
+        $connection1->sendData('Hello');
+        delay(.01);
+        $this->assertEquals('Hello', $data2[0][0]);
+
+        $connection2->sendData('Bye');
+        delay(.01);
+        $this->assertEquals('Bye', $data1[0][0]);
+
+        $connection1->close();
+        $connection2->close();
+    }
+
+    public function testConnectWithTurnServerUdp()
+    {
+        $this->requireLocalTurnServer();
+
+        $config = clone $this->config;
+        $config->setTurnServer([self::localServerHost(), 3478]);
+        $config->setTurnUsername('quasarstream');
+        $config->setTurnPassword('123');
+        $connection1 = $this->iceConnection($config);
+        $connection2 = $this->getIceConnection(false);
+
+        $this->inviteAccept($connection1, $connection2);
+
+        $this->assertCandidateTypes($connection1, ['host', 'relay']);
+        $this->assertCandidateTypes($connection2, ['host']);
+
+        $candidate = $connection1->getDefaultCandidate(1);
+        $this->assertNotNull($candidate);
+        $this->assertEquals('relay', $candidate->getType()->name);
+        $this->assertNotNull($candidate->getRelatedAddress());
+        $this->assertNotNull($candidate->getRelatedPort());
+
+        $this->asyncConnect($connection1, $connection2);
+
+        $data1 = [];
+        $data2 = [];
+        $this->getData($connection1, $data1);
+        $this->getData($connection2, $data2);
+
+        $connection1->sendData('Hello');
+        delay(.01);
+        $this->assertEquals('Hello', $data2[0][0]);
+
+        $connection2->sendData('Bye');
+        delay(.01);
+        $this->assertEquals('Bye', $data1[0][0]);
+
+        $connection1->close();
+        $connection2->close();
+    }
+
+    /**
+     * Connect two agents whose keepalives run ten times faster than usual.
+     *
+     * @return array{RTCIceConnection, RTCIceConnection}
+     */
+    private function connectFast(): array
+    {
+        $connection1 = $this->getIceConnection();
+        $connection2 = $this->getIceConnection(false);
+        self::twoLoopbackPathsOnWindows($connection1);
+        self::twoLoopbackPathsOnWindows($connection2);
+        $connection1->setTimeScale(0.1);
+        $connection2->setTimeScale(0.1);
+        $this->inviteAccept($connection1, $connection2);
+        $this->asyncConnect($connection1, $connection2);
+        return [$connection1, $connection2];
+    }
+
+    /**
+     * @return list<RTCIceCandidatePair>
+     */
+    private static function validPairs(RTCIceConnection $connection): array
+    {
+        return (new ReflectionMethod(RTCIceConnection::class, 'getValidPairs'))->invoke($connection, 1);
+    }
+
+    /**
+     * Send data until it's received, as the receiving side may still be switching paths.
+     */
+    private function sendUntilReceived(RTCIceConnection $from, array &$data, string $payload, float $timeout = 5.0): void
+    {
+        $deadline = microtime(true) + $timeout;
+        while ($data === [] && microtime(true) < $deadline) {
+            $from->sendData($payload);
+            delay(0.1);
+        }
+        $this->assertNotEmpty($data, 'The data was not received');
+        $this->assertSame($payload, $data[0][0]);
+    }
+
+    public function testConsentExpiresWhenNoPathAnswers()
+    {
+        [$connection1, $connection2] = $this->connectFast();
+        $this->assertCount(1, $connection1->getNominated());
+
+        $connection2->close();
+        // Not right away: only once no pair answered for the whole consent timeout (3 seconds here).
+        delay(1);
+        $this->assertFalse($connection1->isClosed());
+        $deadline = microtime(true) + 8;
+        while (!$connection1->isClosed() && microtime(true) < $deadline) {
+            delay(0.1);
+        }
+        $this->assertTrue($connection1->isClosed(), 'Consent did not expire');
+    }
+
+    public function testConsentStaysValid()
+    {
+        [$connection1, $connection2] = $this->connectFast();
+
+        // Longer than the consent timeout (3 seconds here): the keepalives keep the connection up.
+        delay(5);
+        $this->assertFalse($connection1->isClosed());
+        $this->assertFalse($connection2->isClosed());
+        $this->assertCount(1, $connection1->getNominated());
+
+        $data = [];
+        $this->getData($connection2, $data);
+        $this->sendUntilReceived($connection1, $data, 'Hello');
+
+        $connection1->close();
+        $connection2->close();
+    }
+
+    public function testCandidatesTrickledAfterCompletionBecomeBackups()
+    {
+        $connection1 = $this->getIceConnection();
+        $connection2 = $this->getIceConnection(false);
+        self::twoLoopbackPathsOnWindows($connection1);
+        self::twoLoopbackPathsOnWindows($connection2);
+        $connection1->setTimeScale(0.1);
+        $connection2->setTimeScale(0.1);
+
+        $connection1->gatherCandidates();
+        foreach ($connection1->getLocalCandidates() as $candidate) {
+            $connection2->addRemoteCandidate($candidate);
+        }
+        $connection2->endOfRemoteCandidate();
+        $connection2->setRemoteUsername($connection1->getLocalUsername());
+        $connection2->setRemotePassword($connection1->getLocalPassword());
+        // The first agent connects with one candidate of the other: the others arrive once ICE completed.
+        $connection2->gatherCandidates();
+        $late = $connection2->getLocalCandidates();
+        $first = array_shift($late);
+        if ($late === []) {
+            $connection1->close();
+            $connection2->close();
+            $this->markTestSkipped('Needs at least two network paths between the agents');
+        }
+        $connection1->addRemoteCandidate($first);
+        $connection1->setRemoteUsername($connection2->getLocalUsername());
+        $connection1->setRemotePassword($connection2->getLocalPassword());
+        $this->asyncConnect($connection1, $connection2);
+        foreach ($late as $candidate) {
+            $connection1->addRemoteCandidate($candidate);
+        }
+
+        $deadline = microtime(true) + 10;
+        $lateBackup = static fn (): bool => array_filter(
+            self::validPairs($connection1),
+            static fn (RTCIceCandidatePair $pair): bool => \in_array($pair->getRemoteCandidate(), $late, true)
+        ) !== [];
+        while (!$lateBackup() && microtime(true) < $deadline) {
+            delay(0.1);
+        }
+        $this->assertTrue($lateBackup(), 'No pair with a candidate trickled after completion was checked');
+
+        $connection1->close();
+        $connection2->close();
+    }
+
+    public function testFailoverWhenTheSelectedPathStops()
+    {
+        [$connection1, $connection2] = $this->connectFast();
+
+        // The keepalives validate the pairs that were not checked when ICE completed: they're the backups.
+        $deadline = microtime(true) + 5;
+        while ((\count(self::validPairs($connection1)) < 2 || \count(self::validPairs($connection2)) < 2) && microtime(true) < $deadline) {
+            delay(0.1);
+        }
+        if (\count(self::validPairs($connection1)) < 2 || \count(self::validPairs($connection2)) < 2) {
+            $connection1->close();
+            $connection2->close();
+            $this->markTestSkipped('Needs at least two network paths between the agents');
+        }
+
+        $selected = $connection1->getNominated()[1];
+        // As if the network interface of the selected pair went down.
+        $selected->getProtocol()->close();
+
+        $deadline = microtime(true) + 5;
+        while ($connection1->getNominated()[1] === $selected && microtime(true) < $deadline) {
+            delay(0.1);
+        }
+        $this->assertNotSame($selected, $connection1->getNominated()[1], 'No switch to a backup');
+        $this->assertFalse($connection1->isClosed());
+        $this->assertFalse($connection2->isClosed());
+
+        $data1 = [];
+        $data2 = [];
+        $this->getData($connection1, $data1);
+        $this->getData($connection2, $data2);
+        $this->sendUntilReceived($connection1, $data2, 'Hello');
+        $this->sendUntilReceived($connection2, $data1, 'Bye');
+
+        $connection1->close();
+        $connection2->close();
+    }
+
+    /**
+     * A pair on a mock protocol, validated by a check.
+     *
+     * @param list<float> $rtts Round-trip times measured on the pair.
+     */
+    private function validPair(array $rtts, CandidateType $type = CandidateType::host, int $priority = 2130706431, ?float $lastResponseAt = null): RTCIceCandidatePair
+    {
+        $local = new RTCIceCandidate(1);
+        $local->setType($type);
+        $local->setPriority($priority);
+        $protocol = Mockery::mock(IceConnectionProtocolInterface::class);
+        $protocol->allows('getCandidate')->andReturn($local);
+        $protocol->allows('getId')->andReturn(uniqid());
+        $remote = new RTCIceCandidate(1);
+        $remote->setType(CandidateType::host);
+        $remote->setPriority(2130706431);
+        $pair = new RTCIceCandidatePair($protocol, $remote);
+        $pair->setState(RTCIceCandidatePairStats::SUCCEEDED);
+        $now = microtime(true);
+        foreach ($rtts as $rtt) {
+            $pair->recordResponse($rtt, $lastResponseAt ?? $now);
+        }
+        return $pair;
+    }
+
+    /**
+     * Run the pair selection of a connection whose selected pair and backups are the specified ones.
+     *
+     * @param list<RTCIceCandidatePair> $backups
+     */
+    private function select(RTCIceCandidatePair $selected, array $backups, ?float $lastSwitchAt = null): RTCIceCandidatePair
+    {
+        $connection = new RTCIceConnection($this->config, IceRole::Controlling);
+        (new \ReflectionProperty(RTCIceConnection::class, 'checkList'))->setValue($connection, [$selected, ...$backups]);
+        (new \ReflectionProperty(RTCIceConnection::class, 'nominated'))->setValue($connection, [1 => $selected]);
+        (new \ReflectionProperty(RTCIceConnection::class, 'lastSwitchAt'))->setValue($connection, $lastSwitchAt);
+        (new ReflectionMethod(RTCIceConnection::class, 'selectPair'))->invoke($connection, 1, microtime(true));
+        return $connection->getNominated()[1];
+    }
+
+    public function testSwitchesToAMuchFasterPair()
+    {
+        $selected = $this->validPair([0.100, 0.100, 0.100]);
+        $faster = $this->validPair([0.040, 0.040, 0.040]);
+        $this->assertSame($faster, $this->select($selected, [$faster]));
+    }
+
+    public function testDoesNotSwitchForASmallGain()
+    {
+        $selected = $this->validPair([0.100, 0.100, 0.100]);
+        $slightlyFaster = $this->validPair([0.080, 0.080, 0.080]);
+        $this->assertSame($selected, $this->select($selected, [$slightlyFaster]));
+    }
+
+    public function testDoesNotSwitchBetweenFastPaths()
+    {
+        // Half the latency, but 1ms faster.
+        $selected = $this->validPair([0.002, 0.002, 0.002]);
+        $faster = $this->validPair([0.001, 0.001, 0.001]);
+        $this->assertSame($selected, $this->select($selected, [$faster]));
+    }
+
+    public function testDoesNotSwitchWithoutEnoughMeasurements()
+    {
+        $selected = $this->validPair([0.100, 0.100, 0.100]);
+        $faster = $this->validPair([0.010]);
+        $this->assertSame($selected, $this->select($selected, [$faster]));
+    }
+
+    public function testARelayedPairNeedsAMuchLowerLatency()
+    {
+        $selected = $this->validPair([0.080, 0.080, 0.080]);
+        // 40ms faster, but relayed.
+        $relayed = $this->validPair([0.040, 0.040, 0.040], CandidateType::relay, 16777215);
+        $this->assertSame($selected, $this->select($selected, [$relayed]));
+    }
+
+    public function testSwitchesAreRateLimited()
+    {
+        $selected = $this->validPair([0.100, 0.100, 0.100]);
+        $faster = $this->validPair([0.040, 0.040, 0.040]);
+        $this->assertSame($selected, $this->select($selected, [$faster], microtime(true) - 1));
+        $this->assertSame($faster, $this->select($selected, [$faster], microtime(true) - 11));
+    }
+
+    public function testFailoverPicksTheFastestLiveBackup()
+    {
+        // The selected pair stopped answering 4 seconds ago; switching for a failure is not rate-limited.
+        $selected = $this->validPair([0.020], lastResponseAt: microtime(true) - 4);
+        $slow = $this->validPair([0.200]);
+        $fast = $this->validPair([0.050]);
+        $dead = $this->validPair([0.010], lastResponseAt: microtime(true) - 20);
+        $this->assertSame($fast, $this->select($selected, [$slow, $fast, $dead], microtime(true)));
+    }
+
+    public function testNoFailoverWithoutALiveBackup()
+    {
+        $selected = $this->validPair([0.020], lastResponseAt: microtime(true) - 4);
+        $dead = $this->validPair([0.010], lastResponseAt: microtime(true) - 20);
+        $this->assertSame($selected, $this->select($selected, [$dead]));
+    }
+
+    public function testASendThatFailsIsDropped()
+    {
+        // The socket of the selected pair is gone, which wasn't noticed yet.
+        $selected = $this->validPair([0.020]);
+        $selected->getRemoteCandidate()->setHost('127.0.0.1');
+        $selected->getRemoteCandidate()->setPort(9);
+        $selected->getProtocol()->expects('send')->andThrow(new \Amp\Socket\SocketException('The datagram socket is not writable'));
+        $connection = new RTCIceConnection($this->config, IceRole::Controlling);
+        (new \ReflectionProperty(RTCIceConnection::class, 'checkList'))->setValue($connection, [$selected]);
+        (new \ReflectionProperty(RTCIceConnection::class, 'nominated'))->setValue($connection, [1 => $selected]);
+
+        // Like any datagram that is lost: the senders keep going, and the keepalives find another path.
+        $connection->sendData('media');
+        $this->assertSame($selected, $connection->getNominated()[1]);
+    }
+
+    //FIXME
+//    public function testSendNotConnected()
+//    {
+//        $connection = $this->getIceConnection();
+//
+//        $this->expectException(RuntimeException::class);
+//        $this->expectExceptionMessage('No Connection');
+//        $connection->sendData('Hello');
+//    }
+
+    public function testAddRemoteCandidate()
+    {
+        $connection = $this->getIceConnection();
+
+        $remoteCandidate = new RTCIceCandidate(1);
+        $remoteCandidate->setFoundation('foundation');
+        $remoteCandidate->setTransport(TransportType::udp);
+        $remoteCandidate->setPriority(123456);
+        $remoteCandidate->setHost('1.2.3.4');
+        $remoteCandidate->setPort(4321);
+        $remoteCandidate->setType(CandidateType::host);
+
+        $connection->addRemoteCandidate($remoteCandidate);
+        $this->assertCount(1, $connection->getRemoteCandidates());
+        $this->assertEquals('1.2.3.4', $connection->getRemoteCandidates()[0]->getHost());
+        $this->assertFalse($connection->isRemoteCandidatesEnd());
+
+        $connection->endOfRemoteCandidate();
+        $this->assertCount(1, $connection->getRemoteCandidates());
+        $this->assertTrue($connection->isRemoteCandidatesEnd());
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('Unable to add remote candidate after the end-of-candidates stage.');
+        $connection->addRemoteCandidate($remoteCandidate);
+        $this->assertCount(1, $connection->getRemoteCandidates());
+        $this->assertTrue($connection->isRemoteCandidatesEnd());
+    }
+
+    public function testAddRemoteCandidateMdnsBad()
+    {
+        $mdnsMock = new MdnsServerMock(['test.local' => '192.168.1.20']);
+        $mdnsMock->start();
+
+        $connection = $this->getIceConnection();
+
+        $remoteCandidate = new RTCIceCandidate(1);
+        $remoteCandidate->setFoundation('foundation');
+        $remoteCandidate->setTransport(TransportType::udp);
+        $remoteCandidate->setPriority(123456);
+        $remoteCandidate->setHost('test-wrong.local');
+        $remoteCandidate->setPort(4321);
+        $remoteCandidate->setType(CandidateType::host);
+
+        $connection->addRemoteCandidate($remoteCandidate);
+        $this->assertCount(0, $connection->getRemoteCandidates());
+        $this->assertFalse($connection->isRemoteCandidatesEnd());
+
+        $connection->close();
+        $mdnsMock->stop();
+    }
+
+    public function testAddRemoteCandidateMdnsGood()
+    {
+        $mdnsMock = new MdnsServerMock(['test.local' => '192.168.1.20'], '127.0.0.1:0');
+        $bound = $mdnsMock->start();
+
+        $connection = $this->getIceConnection();
+        $connection->setMdnsFactory(new \Webrtc\MDNS\Factory(new \Webrtc\MDNS\MulticastExecutor($bound)));
+
+        $remoteCandidate = new RTCIceCandidate(1);
+        $remoteCandidate->setFoundation('foundation');
+        $remoteCandidate->setTransport(TransportType::udp);
+        $remoteCandidate->setPriority(123456);
+        $remoteCandidate->setHost('test.local');
+        $remoteCandidate->setPort(1234);
+        $remoteCandidate->setType(CandidateType::host);
+
+        $connection->addRemoteCandidate($remoteCandidate);
+
+        $this->assertCount(1, $connection->getRemoteCandidates());
+        $this->assertEquals('192.168.1.20', $connection->getRemoteCandidates()[0]->getHost());
+        $this->assertFalse($connection->isRemoteCandidatesEnd());
+
+        $connection->close();
+        $mdnsMock->stop();
+    }
+
+    public function testGatherCandidatesRelayOnlyNoServers()
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('Relay transport policy requires a STUN and/or TURN server.');
+        $connection = $this->getIceConnection();
+        $connection->setTransportPolicy(TransportPolicyType::RELAY);
+    }
+
+    public function testGatherCandidatesRelayOnlyWithStunServer()
+    {
+        $this->requireLocalTurnServer();
+
+        $config = clone $this->config;
+        $config->setStunServer([self::localServerHost(), 3478]);
+        $connection1 = $this->iceConnection($config);
+        $connection1->setTransportPolicy(TransportPolicyType::RELAY);
+        $connection2 = $this->getIceConnection(false);
+
+        $this->inviteAccept($connection1, $connection2);
+
+        $this->assertCandidateTypes($connection1, ['srflx']);
+        $this->assertCandidateTypes($connection2, ['host']);
+
+        $candidate = $connection1->getDefaultCandidate(1);
+        $this->assertNotNull($candidate);
+        $this->assertEquals('srflx', $candidate->getType()->name);
+        $this->assertNotNull($candidate->getRelatedAddress());
+        $this->assertNotNull($candidate->getRelatedPort());
+
+        $this->asyncConnect($connection1, $connection2);
+
+        $data1 = [];
+        $data2 = [];
+        $this->getData($connection1, $data1);
+        $this->getData($connection2, $data2);
+
+        $connection1->sendData('Hello');
+        delay(.01);
+        $this->assertEquals('Hello', $data2[0][0]);
+
+        $connection2->sendData('Bye');
+        delay(.01);
+        $this->assertEquals('Bye', $data1[0][0]);
+
+        $connection1->close();
+        $connection2->close();
+    }
+
+    public function testEveryValidPairOfARelayedAgentCarriesData()
+    {
+        $this->requireLocalTurnServer();
+
+        $config = clone $this->config;
+        $config->setTurnServer([self::localServerHost(), 3478]);
+        $config->setTurnUsername('quasarstream');
+        $config->setTurnPassword('123');
+        $connection1 = $this->iceConnection($config);
+        $connection1->setTransportPolicy(TransportPolicyType::RELAY);
+        $connection2 = $this->getIceConnection(false);
+        $connection1->setTimeScale(0.1);
+        $connection2->setTimeScale(0.1);
+        $this->inviteAccept($connection1, $connection2);
+        $this->asyncConnect($connection1, $connection2);
+        // The keepalives check the pairs that were not checked yet.
+        delay(2);
+
+        $data1 = [];
+        $this->getData($connection1, $data1);
+        $valid = self::validPairs($connection2);
+        $this->assertNotEmpty($valid);
+        // The checks of a relayed candidate are relayed too: a pair to the socket of the allocation, which the data
+        // never comes from, would look valid but drop everything sent on it.
+        foreach ($valid as $pair) {
+            (new \ReflectionProperty(RTCIceConnection::class, 'nominated'))->setValue($connection2, [1 => $pair]);
+            $data1 = [];
+            $this->sendUntilReceived($connection2, $data1, "Hello via $pair", 2);
+        }
+
+        $connection1->close();
+        $connection2->close();
+    }
+
+    public function testGatherCandidatesRelayOnlyWithTurnServer()
+    {
+        $this->requireLocalTurnServer();
+
+        $config = clone $this->config;
+        $config->setTurnServer([self::localServerHost(), 3478]);
+        $config->setTurnUsername('quasarstream');
+        $config->setTurnPassword('123');
+        $connection = $this->iceConnection($config);
+        $connection->setTransportPolicy(TransportPolicyType::RELAY);
+
+        $connection->gatherCandidates();
+        $this->assertCandidateTypes($connection, ['relay']);
+
+        $candidate = $connection->getDefaultCandidate(1);
+        $this->assertNotNull($candidate);
+        $this->assertEquals('relay', $candidate->getType()->name);
+        $this->assertNotNull($candidate->getRelatedAddress());
+        $this->assertNotNull($candidate->getRelatedPort());
+
+        // It must have a pair to connect and round-trip data
+        $connection->close();
+    }
+
+    public function testPeerReflexive()
+    {
+        $connection = $this->getIceConnection();
+        $connection->setRemoteUsername('username');
+        $connection->setRemotePassword('password');
+
+        $candidateMock = Mockery::mock(RTCIceCandidate::class);
+        $candidateMock->shouldReceive('getComponentId')->once()->andReturn(1);
+        $candidateMock->shouldReceive('getPriority')->once()->andReturn(1234596);
+
+        $protocolMock = Mockery::mock(StunInterface::class);
+        $protocolMock->shouldReceive('getCandidate')->andReturn($candidateMock);
+        $protocolMock->shouldReceive('request')->andReturnUsing(function (...$args) {
+            // request() blocks and throws now, rather than handing back a rejected promise.
+            throw new TransactionTimeoutException();
+        });
+
+        $messageAttr = [
+            MessageAttribute::PRIORITY->name => 987520
+        ];
+        $message = Message::new(MessageClass::REQUEST, MessageMethod::BINDING, $messageAttr);
+
+        $connection->checkIncoming($message, new InternetAddress("127.0.0.0", 1234), $protocolMock);
+
+        $this->assertCount(1, $connection->getRemoteCandidates());
+        $candidate = $connection->getRemoteCandidates()[0];
+        $this->assertEquals(1, $candidate->getComponentId());
+        $this->assertEquals('udp', $candidate->getTransport()->name);
+        $this->assertEquals(987520, $candidate->getPriority());
+        $this->assertEquals('127.0.0.0', $candidate->getHost());
+        $this->assertEquals(1234, $candidate->getPort());
+        $this->assertEquals('prflx', $candidate->getType()->name);
+        $this->assertNull($candidate->getGeneration());
+
+        $this->assertCount(1, $connection->getCheckList());
+        $pair = $connection->getCheckList()[0];
+        $this->assertEquals($protocolMock, $pair->getProtocol());
+        $this->assertEquals($candidate, $pair->getRemoteCandidate());
+    }
+
+    public function testRequestWithInvalidMethod()
+    {
+        $connection = $this->getIceConnection();
+
+        $messages = [];
+        $protocolMock = Mockery::mock(StunInterface::class);
+        $protocolMock->allows('getId')->andReturn('mock');
+        $protocolMock->shouldReceive('sendMessage')->andReturnUsing(function (...$args) use (&$messages) {
+            $messages[] = $args[0];
+        });
+
+        $message = Message::new(MessageClass::REQUEST, MessageMethod::ALLOCATE);
+
+        $connection->onRequestReceived($message, new InternetAddress("127.0.0.1", 1234), $protocolMock, (string)$message);
+        $this->assertCount(1, $messages);
+        $this->assertEquals(MessageMethod::ALLOCATE, $messages[0]->getMessageMethod());
+        $this->assertEquals(MessageClass::ERROR, $messages[0]->getMessageClass());
+        $this->assertEquals([400, 'Bad Request'], $messages[0]->attributes()->get(MessageAttribute::ERROR_CODE));
+    }
+
+    public function testResponseWithInvalidAddress()
+    {
+        $connection = $this->getIceConnection();
+        $connection->setRemoteUsername('username');
+        $connection->setRemotePassword('password');
+
+        $candidateMock = Mockery::mock(RTCIceCandidate::class);
+        $candidateMock->shouldReceive('getHost')->once()->andReturn("127.0.0.1");
+        $candidateMock->shouldReceive('getPort')->once()->andReturn(1234);
+        $candidateMock->shouldReceive('getPriority')->once()->andReturn(564123);
+
+        $protocolMock = Mockery::mock(StunInterface::class);
+        $protocolMock->shouldReceive('getCandidate')->andReturn($candidateMock);
+        $protocolMock->shouldReceive('request')->andReturnUsing(function (...$args) {
+            // request() blocks and throws now, rather than handing back a rejected promise.
+            throw new TransactionTimeoutException();
+        });
+
+        $remoteCandidate = new RTCIceCandidate(1);
+        $remoteCandidate->setFoundation('foundation');
+        $remoteCandidate->setTransport(TransportType::udp);
+        $remoteCandidate->setPriority(123456);
+        $remoteCandidate->setHost('192.0.2.1');
+        $remoteCandidate->setPort(1234);
+        $remoteCandidate->setType(CandidateType::host);
+
+
+        $pair = new RTCIceCandidatePair($protocolMock, $remoteCandidate);
+        $this->assertEquals("CandidatePair(Local Address: 127.0.0.1:1234 -> Remote Address: 192.0.2.1:1234 | State: FROZEN)", (string)$pair);
+
+        $connection->startCheckBinding($pair);
+
+        // The check runs in its own fiber so the check list keeps moving, so the pair does
+        // not reach its terminal state until the loop has had a turn.
+        delay(.01);
+
+        $this->assertEquals(RTCIceCandidatePairStats::FAILED, $pair->getState());
+    }
+
+    /**
+     * A UDP port on loopback that nothing is listening on, so a STUN request to it times out.
+     */
+    private static function unusedUdpPort(): int
+    {
+        $socket = stream_socket_server('udp://127.0.0.1:0', $errno, $errstr, STREAM_SERVER_BIND);
+        if ($socket === false) {
+            throw new \RuntimeException("Could not bind an ephemeral UDP socket: $errstr");
+        }
+
+        $name = (string) stream_socket_get_name($socket, false);
+        fclose($socket);
+
+        $colon = strrpos($name, ':');
+        $port = $colon === false ? 0 : (int) substr($name, $colon + 1);
+        if ($port < 1) {
+            throw new \RuntimeException("Could not read the ephemeral UDP port from $name");
+        }
+
+        return $port;
+    }
+
+    /**
+     * Resolve the pion/turn test-server binary (tests/turnserver). CI prebuilds it and points
+     * PHP_RTC_TURN_BINARY at it; otherwise it is built on demand with the Go toolchain. Returns
+     * null when no binary can be produced (e.g. Go is not installed), so the STUN/TURN tests skip
+     * rather than error.
+     */
+    private static function turnServerBinary(): ?string
+    {
+        $env = getenv('PHP_RTC_TURN_BINARY');
+        if ($env !== false && $env !== '' && is_file($env) && is_executable($env)) {
+            return $env;
+        }
+
+        return self::buildTurnServer();
+    }
+
+    private static function buildTurnServer(): ?string
+    {
+        $go = self::findGoBinary();
+        if ($go === null) {
+            return null;
+        }
+
+        $out = tempnam(sys_get_temp_dir(), 'php-rtc-turn-');
+        if ($out === false) {
+            return null;
+        }
+        if (DIRECTORY_SEPARATOR === '\\') {
+            @unlink($out);
+            $out .= '.exe';
+        }
+
+        $process = proc_open(
+            [$go, 'build', '-o', $out, '.'],
+            [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+            $pipes,
+            __DIR__ . DIRECTORY_SEPARATOR . 'turnserver',
+        );
+        if (!is_resource($process)) {
+            @unlink($out);
+            return null;
+        }
+        $stderr = (string) stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        $exit = proc_close($process);
+        if ($exit !== 0 || !is_file($out)) {
+            @unlink($out);
+            fwrite(STDERR, "Could not build the pion/turn test server:\n" . $stderr . "\n");
+            return null;
+        }
+
+        // Remember it so tearDownAfterClass can remove the temporary binary.
+        self::$turnServerBinaryBuilt = $out;
+
+        return $out;
+    }
+
+    private static function findGoBinary(): ?string
+    {
+        $names = DIRECTORY_SEPARATOR === '\\' ? ['go.exe', 'go'] : ['go'];
+        foreach (explode(PATH_SEPARATOR, (string) getenv('PATH')) as $directory) {
+            foreach ($names as $name) {
+                $binary = rtrim($directory, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $name;
+                if (is_file($binary) && is_executable($binary)) {
+                    return $binary;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static function turnServerIsReady(): bool
+    {
+        $socket = @stream_socket_client('tcp://127.0.0.1:3478', $errorCode, $errorMessage, .1);
+        if ($socket === false) {
+            return false;
+        }
+
+        fclose($socket);
+        return true;
+    }
+
+    private static function stopTurnServer(): void
+    {
+        if (is_resource(self::$turnServerProcess)) {
+            $status = proc_get_status(self::$turnServerProcess);
+            if ($status['running']) {
+                proc_terminate(self::$turnServerProcess);
+
+                $deadline = microtime(true) + 1;
+                do {
+                    usleep(10_000);
+                    $status = proc_get_status(self::$turnServerProcess);
+                } while ($status['running'] && microtime(true) < $deadline);
+
+                if ($status['running']) {
+                    proc_terminate(self::$turnServerProcess, 9);
+                }
+            }
+
+            proc_close(self::$turnServerProcess);
+            self::$turnServerProcess = null;
+        }
+
+        self::removeTurnServerFiles();
+    }
+
+    private static function removeTurnServerFiles(): void
+    {
+        if (self::$turnServerLog !== null) {
+            @unlink(self::$turnServerLog);
+            self::$turnServerLog = null;
+        }
+        if (self::$turnServerBinaryBuilt !== null) {
+            @unlink(self::$turnServerBinaryBuilt);
+            self::$turnServerBinaryBuilt = null;
+        }
+    }
+
+    private function requireLocalTurnServer(): void
+    {
+        if (!self::turnServerIsReady()) {
+            $this->markTestSkipped(self::$turnServerUnavailableReason ?? 'The test-managed STUN/TURN server is unavailable.');
+        }
+    }
+
+    /**
+     * Loopback address of the test-managed STUN/TURN server.
+     *
+     * Windows tests also bind host candidates to 127.0.0.1 (see iceConnection()), so the
+     * STUN/TURN path is loopback-to-loopback and does not depend on the strong host model.
+     */
+    private static function localServerHost(): string
+    {
+        return '127.0.0.1';
+    }
+
+    private function assertCandidateTypes(RTCIceConnection $conn, array $expected): void
+    {
+        $types = array_unique(array_map(fn(RTCIceCandidate $c) => $c->getType()->name, $conn->getLocalCandidates()));
+        $this->assertEquals($expected, array_values($types));
+    }
+
+    private function getIceConnection(bool $iceControlling = true): RTCIceConnection
+    {
+        return $this->iceConnection(null, $iceControlling);
+    }
+
+    /**
+     * @param RTCIceProtocolConfiguration|null $config
+     */
+    private function iceConnection(?RTCIceProtocolConfiguration $config = null, bool $iceControlling = true): RTCIceConnection
+    {
+        $connection = new RTCIceConnection(
+            $config ?? $this->config,
+            $iceControlling ? IceRole::Controlling : IceRole::Controlled,
+        );
+        self::pinLoopbackOnWindows($connection);
+
+        return $connection;
+    }
+
+    /**
+     * On Windows a LAN-bound host-candidate socket cannot reach a loopback-bound peer or the
+     * loopback STUN/TURN server (strong host model). Pin host candidates to 127.0.0.1 so every
+     * agent in a test — including the hand-built mocks the consent tests use — gathers and checks
+     * over loopback and can reach both its peer and the local server.
+     */
+    private static function pinLoopbackOnWindows(RTCIceConnection $connection): void
+    {
+        if (PHP_OS_FAMILY === 'Windows') {
+            $connection->setNat1to1(['127.0.0.1']);
+        }
+    }
+
+    /**
+     * Gives the agent two network paths on Windows too, where its host candidates are pinned to the loopback: one over
+     * IPv4, one over IPv6.
+     */
+    private static function twoLoopbackPathsOnWindows(RTCIceConnection $connection): void
+    {
+        if (PHP_OS_FAMILY === 'Windows') {
+            $connection->setNat1to1(['127.0.0.1', '[::1]']);
+        }
+    }
+
+    private function inviteAccept(RTCIceConnection $connection1, RTCIceConnection $connection2): void
+    {
+        // Invite
+        $connection1->gatherCandidates();
+        foreach ($connection1->getLocalCandidates() as $candidate) {
+            $connection2->addRemoteCandidate($candidate);
+        }
+        $connection2->endOfRemoteCandidate();
+        $connection2->setRemoteUsername($connection1->getLocalUsername());
+        $connection2->setRemotePassword($connection1->getLocalPassword());
+
+        // Accept
+        $connection2->gatherCandidates();
+        foreach ($connection2->getLocalCandidates() as $candidate) {
+            $connection1->addRemoteCandidate($candidate);
+        }
+        $connection1->endOfRemoteCandidate();
+        $connection1->setRemoteUsername($connection2->getLocalUsername());
+        $connection1->setRemotePassword($connection2->getLocalPassword());
+    }
+
+    /** @var list<IceConnectionDataListener> Keeps typed listeners alive against the WeakMap registry. */
+    private array $keptDataListeners = [];
+
+    private function getData(RTCIceConnection $iceConnection, array &$data): void
+    {
+        $listener = new class implements IceConnectionDataListener {
+            /** @var array<int, array{string, int}> */
+            public $sink;
+
+            public function onIceConnectionData(string $data, int $componentId): void
+            {
+                $this->sink[] = [$data, $componentId];
+            }
+        };
+        $listener->sink = &$data;
+        // The registry is a WeakMap, so hold a strong reference for the test's lifetime.
+        $this->keptDataListeners[] = $listener;
+        $iceConnection->addDataListener($listener);
+    }
+
+    /**
+     * Polls the connection loop until at least one datagram has been received, so
+     * delivery checks don't depend on fixed sleeps that are too short on slow CI nodes.
+     */
+    private function waitForData(array &$data, float $timeout = 5.0): void
+    {
+        $deadline = microtime(true) + $timeout;
+        while (!isset($data[0]) && microtime(true) < $deadline) {
+            delay(.01);
+        }
+    }
+
+    private function isSupportIPv6(): bool
+    {
+        $socket = @stream_socket_server("tcp://[::1]:0", $errno, $errstr);
+
+        if ($socket === false) {
+            return false;
+        }
+
+        fclose($socket);
+
+        return true;
+    }
+
+    private function asyncConnect(RTCIceConnection $connection1, RTCIceConnection $connection2): void
+    {
+        // Both agents have to be checking at the same time for the exchange to converge, so
+        // each connect() runs in its own fiber and the test waits for both.
+        $futures = [async(fn() => $connection1->connect()), async(fn() => $connection2->connect())];
+        try {
+            await($futures);
+        } catch (\Throwable $e) {
+            foreach ($futures as $future) {
+                $future->ignore();
+            }
+            throw $e;
+        }
+    }
+}

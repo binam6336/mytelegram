@@ -1,0 +1,2626 @@
+<?php
+
+/**
+ * This file is part of the PHP WebRTC package.
+ *
+ * (c) Amin Yazdanpanah <https://www.aminyazdanpanah.com/#contact>
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Webrtc\Webrtc;
+
+use DateInvalidOperationException;
+use Override;
+use Psr\Log\LoggerInterface;
+use Ramsey\Uuid\Uuid;
+use Revolt\EventLoop;
+use Random\RandomException;
+use Throwable;
+use Webrtc\Codecs\Codec;
+use Webrtc\Codecs\CodecUtility;
+use Webrtc\DataChannel\RTCDataChannel;
+use Webrtc\DataChannel\RTCDataChannelParameters;
+use Webrtc\DTLS\DTLS\Exception\DTLSException;
+use Webrtc\DTLS\DTLS\Exception\RTCCertificateException;
+use Webrtc\DTLS\DTLS\Exception\TLSException;
+use Webrtc\DTLS\DTLS\RTCCertificate;
+use Webrtc\DTLS\DTLS\RTCDtlsTransport;
+use Webrtc\DTLS\Listener\DtlsTransportStateChangeListener;
+use Webrtc\DTLS\Exception\OpenSSLException;
+use Webrtc\DTLS\Exception\SSLException;
+use Webrtc\DTLS\Exception\SysCallException;
+use Webrtc\DTLS\Exception\ZeroReturnException;
+use Webrtc\Exception\InvalidArgumentException;
+use Webrtc\Exception\RuntimeException;
+use Webrtc\ICE\Enum\IceGatheringState;
+use Webrtc\ICE\Enum\IceRole;
+use Webrtc\ICE\Enum\IceTransportState;
+use Webrtc\ICE\Listener\IceGathererStateChangeListener;
+use Webrtc\ICE\Listener\IceTransportStateChangeListener;
+use Webrtc\ICE\RTCIceCandidate;
+use Webrtc\ICE\RTCIceGatherer;
+use Webrtc\ICE\RTCIceParameters;
+use Webrtc\ICE\RTCIceServer;
+use Webrtc\ICE\RTCIceTransport;
+use Webrtc\ICE\RTCIceTransportInterface;
+use Webrtc\NTP\NetworkTimeProtocol;
+use Webrtc\RTP\Enum\MediaKind;
+use Webrtc\RTP\MediaStreamTrack\MediaStreamTrack;
+use Webrtc\RTP\MediaStreamTrack\RemoteStreamTrack;
+use Webrtc\RTP\MediaStreamTrack\RTCTrackEvent;
+use Webrtc\RTP\Receiver\RTCRtpReceiver;
+use Webrtc\RTP\RTCRTPDtlsTransportInterface;
+use Webrtc\RTP\RTCRtpTransceiver;
+use Webrtc\RTP\RtpConstants;
+use Webrtc\RTP\Sender\RTCRtpSender;
+use Webrtc\RTPParameter\RTCRtcpFeedback;
+use Webrtc\RTPParameter\RTCRtpCodecCapability;
+use Webrtc\RTPParameter\RTCRtpCodecParameters;
+use Webrtc\RTPParameter\RTCRtpDecodingParameters;
+use Webrtc\RTPParameter\RTCRtpEncodingParameters;
+use Webrtc\RTPParameter\RTCRtpHeaderExtensionParameters;
+use Webrtc\RTPParameter\RTCRtpParameters;
+use Webrtc\RTPParameter\RTCRtpReceiveParameters;
+use Webrtc\RTPParameter\RTCRtpRtxParameters;
+use Webrtc\RTPParameter\RTCRtpSendParameters;
+use Webrtc\SCTP\Exception\SctpException;
+use Webrtc\SCTP\Listener\DataChannelListener;
+use Webrtc\SCTP\RTCSctpDtlsTransportInterface;
+use Webrtc\SCTP\RTCSctpTransport;
+use Webrtc\SDP\DtlsParameter\RTCDtlsParameters;
+use Webrtc\SDP\Enum\DtlsRole;
+use Webrtc\SDP\Enum\H264Profile;
+use Webrtc\SDP\Enum\SDPDirections;
+use Webrtc\SDP\GroupDescription;
+use Webrtc\SDP\H264Sdp;
+use Webrtc\SDP\MediaDescription;
+use Webrtc\SDP\RTCSessionDescription;
+use Webrtc\SDP\SessionDescription;
+use Webrtc\SDP\SsrcDescription;
+use Webrtc\Srtp\Exception\SrtpException;
+use Webrtc\Stats\enum\TLSState;
+use Webrtc\Stats\RTCStatsReport;
+use Webrtc\Webrtc\Enum\ConnectionState;
+use Webrtc\Webrtc\Enum\IceConnectionState;
+use Webrtc\Webrtc\Enum\SignalingState;
+use Webrtc\Webrtc\Listener\PeerConnectionConnectionStateChangeListener;
+use Webrtc\Webrtc\Listener\PeerConnectionDataChannelListener;
+use Webrtc\Webrtc\Listener\PeerConnectionIceConnectionStateChangeListener;
+use Webrtc\Webrtc\Listener\PeerConnectionIceGatheringStateChangeListener;
+use Webrtc\Webrtc\Listener\PeerConnectionSignalingStateChangeListener;
+use Webrtc\Webrtc\Listener\PeerConnectionTrackListener;
+use Webrtc\Mixin\SerializableState;
+
+/**
+ * RTCPeerConnection represents a WebRTC connection between the local device and a remote peer.
+ *
+ * This class implements the RTCPeerConnectionInterface and provides methods to create and manage
+ * WebRTC connections, including media streaming and data channels.
+ *
+ * Key Features:
+ * - Manages ICE candidates for network connectivity
+ * - Handles DTLS for secure communication
+ * - Supports media tracks (audio/video)
+ * - Provides data channel functionality
+ * - Manages connection state and signaling
+ *
+ * Events:
+ * - "connectionstatechange": Fired when the connection state changes
+ * - "iceconnectionstatechange": Fired when the ICE connection state changes
+ * - "icegatheringstatechange": Fired when the ICE gathering state changes
+ * - "signalingstatechange": Fired when the signaling state changes
+ * - "track": Fired when a new media track is received
+ * - "datachannel": Fired when a new data channel is created by the remote peer
+ */
+final class RTCPeerConnection implements RTCPeerConnectionInterface, DataChannelListener, IceGathererStateChangeListener, IceTransportStateChangeListener, DtlsTransportStateChangeListener
+{
+    /**
+     * Application listeners for a received remote media track.
+     * @var \WeakMap<PeerConnectionTrackListener, null>
+     */
+    private \WeakMap $trackListeners;
+
+    /**
+     * Application listeners for a remotely-opened data channel.
+     * @var \WeakMap<PeerConnectionDataChannelListener, null>
+     */
+    private \WeakMap $peerConnectionDataChannelListeners;
+
+    /**
+     * Application listeners for signaling-state changes.
+     * @var \WeakMap<PeerConnectionSignalingStateChangeListener, null>
+     */
+    private \WeakMap $signalingStateChangeListeners;
+
+    /**
+     * Application listeners for overall connection-state changes.
+     * @var \WeakMap<PeerConnectionConnectionStateChangeListener, null>
+     */
+    private \WeakMap $connectionStateChangeListeners;
+
+    /**
+     * Application listeners for ICE connection-state changes.
+     * @var \WeakMap<PeerConnectionIceConnectionStateChangeListener, null>
+     */
+    private \WeakMap $iceConnectionStateChangeListeners;
+
+    /**
+     * Application listeners for ICE gathering-state changes.
+     * @var \WeakMap<PeerConnectionIceGatheringStateChangeListener, null>
+     */
+    private \WeakMap $iceGatheringStateChangeListeners;
+
+    /**
+     * Port number used for discard protocol (used as placeholder in SDP)
+     */
+    private const DISCARD_PORT = 9;
+
+    /**
+     * IP address used as placeholder in SDP before real candidates are gathered
+     */
+    private const DISCARD_HOST = "0.0.0.0";
+
+    /**
+     * Configuration object containing ICE servers, certificates, and other settings
+     */
+    private ?RTCConfigurationInterface $configuration;
+
+    /**
+     * List of RTCCertificate objects used for DTLS handshake
+     * @var list<RTCCertificate>
+     */
+    private array $certificates = [];
+
+    /**
+     * Canonical Name (CNAME) used in RTCP packets for synchronization
+     */
+    private string $cname;
+
+    /**
+     * List of all active DTLS transports for media and data channels
+     * @var array<int, RTCDtlsTransport>
+     */
+    private array $dtlsTransports = [];
+
+    /**
+     * List of all active ICE transports for network connectivity
+     * @var array<int, RTCIceTransport>
+     */
+    private array $iceTransports = [];
+
+    /**
+     * Remote DTLS parameters indexed by transport object ID
+     * @var array<int, RTCDtlsParameters|null>
+     */
+    private array $remoteDtlsParameter = [];
+
+    /**
+     * Remote ICE parameters indexed by transport object ID
+     * @var array<int, RTCIceParameters|null>
+     */
+    private array $remoteIceParameters = [];
+
+    /**
+     * List of media stream identifiers (MIDs) that have been processed
+     * @var array<string, true>
+     */
+    private array $seenMids = [];
+
+    /**
+     * SCTP transport for data channels (null until first data channel is created)
+     */
+    private ?RTCSctpTransport $sctp = null;
+
+    /**
+     * Flag indicating whether to use legacy SDP format for SCTP
+     */
+    private bool $sctpLegacySdp = true;
+
+    /**
+     * Remote SCTP port number (null until set by remote description)
+     */
+    private ?int $sctpRemotePort = null;
+
+    /**
+     * Whether the SCTP association runs in-band over the media transport, without an SDP
+     * `m=application` section (see {@see self::createInbandSctp()}).
+     */
+    private bool $sctpInband = false;
+
+    /**
+     * Unique identifier for this peer connection's media streams
+     */
+    private string $streamId;
+
+    /**
+     * List of all media transceivers in this connection
+     * @var list<RTCRtpTransceiver>
+     */
+    private array $transceivers = [];
+
+    /**
+     * Overall connection state (connected, disconnected, failed, etc.)
+     * @var ConnectionState
+     */
+    private ConnectionState $connectionState = ConnectionState::new;
+
+    /**
+     * ICE connection state (checking, completed, failed, etc.)
+     * @var IceConnectionState
+     */
+    private IceConnectionState $iceConnectionState = IceConnectionState::new;
+
+    /**
+     * ICE candidate gathering state (new, gathering, complete)
+     * @var IceGatheringState
+     */
+    private IceGatheringState $iceGatheringState = IceGatheringState::new;
+
+    /**
+     * Signaling state for offer/answer negotiation
+     * @var SignalingState
+     */
+    private SignalingState $signalingState = SignalingState::stable;
+
+    /**
+     * Flag indicating whether the connection has been closed
+     */
+    private bool $isClosed = false;
+
+    /**
+     * Current local description that has been successfully negotiated
+     */
+    private ?SessionDescription $currentLocalDescription = null;
+
+    /**
+     * Current remote description that has been successfully negotiated
+     */
+    private ?SessionDescription $currentRemoteDescription = null;
+
+    /**
+     * Local description that is pending negotiation
+     */
+    private ?SessionDescription $pendingLocalDescription = null;
+
+    /**
+     * Remote description that is pending negotiation
+     */
+    private ?SessionDescription $pendingRemoteDescription = null;
+
+    /**
+     * Logger instance for debugging output (optional)
+     */
+    private ?LoggerInterface $logger = null;
+
+    /**
+     * Whether a scheduled connect() is currently running.
+     */
+    private bool $connecting = false;
+
+    /**
+     * Whether a description was applied while connect() was running.
+     */
+    private bool $connectPending = false;
+
+    /**
+     * Creates a new RTCPeerConnection instance.
+     *
+     * @param array{
+     *     iceServers?: list<array{
+     *         urls: string|list<string>,
+     *         username?: string,
+     *         credential?: string,
+     *         credentialType?: string
+     *     }>,
+     *     certificatePath?: string,
+     *     privateKeyPath?: string
+     * }|RTCConfigurationInterface|null $configuration Configuration options for the connection
+     * @throws RTCCertificateException If certificate generation fails
+     * @throws OpenSSLException|DateInvalidOperationException If there's an SSL-related error
+     */
+    public function __construct(null|array|RTCConfigurationInterface $configuration = null)
+    {
+        $this->configuration = $configuration instanceof RTCConfigurationInterface ? $configuration : new RTCConfiguration($configuration);
+        $this->certificates[] = new RTCCertificate($this->configuration->getPrivateKeyPath(), $this->configuration->getCertificatePath());
+        $this->cname = Uuid::uuid4()->toString();
+        $this->streamId = Uuid::uuid4()->toString();
+
+        /** @var \WeakMap<PeerConnectionTrackListener, null> */
+        $this->trackListeners = new \WeakMap();
+        /** @var \WeakMap<PeerConnectionDataChannelListener, null> */
+        $this->peerConnectionDataChannelListeners = new \WeakMap();
+        /** @var \WeakMap<PeerConnectionSignalingStateChangeListener, null> */
+        $this->signalingStateChangeListeners = new \WeakMap();
+        /** @var \WeakMap<PeerConnectionConnectionStateChangeListener, null> */
+        $this->connectionStateChangeListeners = new \WeakMap();
+        /** @var \WeakMap<PeerConnectionIceConnectionStateChangeListener, null> */
+        $this->iceConnectionStateChangeListeners = new \WeakMap();
+        /** @var \WeakMap<PeerConnectionIceGatheringStateChangeListener, null> */
+        $this->iceGatheringStateChangeListeners = new \WeakMap();
+    }
+
+    /**
+     * Register a listener notified when a remote media track is received (was the "track" event).
+     */
+    public function addTrackListener(PeerConnectionTrackListener $listener): void
+    {
+        $this->trackListeners[$listener] = null;
+    }
+
+    /**
+     * Register a listener notified when a remotely-opened data channel arrives (was "datachannel").
+     */
+    public function addPeerConnectionDataChannelListener(PeerConnectionDataChannelListener $listener): void
+    {
+        $this->peerConnectionDataChannelListeners[$listener] = null;
+    }
+
+    /**
+     * Register a listener notified when the signaling state changes (was "signalingstatechange").
+     */
+    public function addSignalingStateChangeListener(PeerConnectionSignalingStateChangeListener $listener): void
+    {
+        $this->signalingStateChangeListeners[$listener] = null;
+    }
+
+    /**
+     * Register a listener notified when the connection state changes (was "connectionstatechange").
+     */
+    public function addConnectionStateChangeListener(PeerConnectionConnectionStateChangeListener $listener): void
+    {
+        $this->connectionStateChangeListeners[$listener] = null;
+    }
+
+    /**
+     * Register a listener notified when the ICE connection state changes (was
+     * "iceconnectionstatechange").
+     */
+    public function addIceConnectionStateChangeListener(PeerConnectionIceConnectionStateChangeListener $listener): void
+    {
+        $this->iceConnectionStateChangeListeners[$listener] = null;
+    }
+
+    /**
+     * Register a listener notified when the ICE gathering state changes (was
+     * "icegatheringstatechange").
+     */
+    public function addIceGatheringStateChangeListener(PeerConnectionIceGatheringStateChangeListener $listener): void
+    {
+        $this->iceGatheringStateChangeListeners[$listener] = null;
+    }
+
+    private function notifyTrack(MediaStreamTrack $track): void
+    {
+        foreach ($this->trackListeners as $listener => $_) {
+            $listener->onPeerConnectionTrack($track);
+        }
+    }
+
+    private function notifyPeerConnectionDataChannel(RTCDataChannel $channel): void
+    {
+        foreach ($this->peerConnectionDataChannelListeners as $listener => $_) {
+            $listener->onPeerConnectionDataChannel($channel);
+        }
+    }
+
+    private function notifySignalingStateChange(): void
+    {
+        foreach ($this->signalingStateChangeListeners as $listener => $_) {
+            $listener->onPeerConnectionSignalingStateChange();
+        }
+    }
+
+    private function notifyConnectionStateChange(): void
+    {
+        foreach ($this->connectionStateChangeListeners as $listener => $_) {
+            $listener->onPeerConnectionConnectionStateChange();
+        }
+    }
+
+    private function notifyIceConnectionStateChange(): void
+    {
+        foreach ($this->iceConnectionStateChangeListeners as $listener => $_) {
+            $listener->onPeerConnectionIceConnectionStateChange();
+        }
+    }
+
+    private function notifyIceGatheringStateChange(): void
+    {
+        foreach ($this->iceGatheringStateChangeListeners as $listener => $_) {
+            $listener->onPeerConnectionIceGatheringStateChange();
+        }
+    }
+
+    /**
+     * Consumes an ICE gatherer's state-change notification (was the "statechange" callable
+     * registered on the gatherer).
+     */
+    #[\Override]
+    public function onIceGathererStateChange(IceGatheringState $state): void
+    {
+        $this->updateIceGatheringState();
+    }
+
+    /**
+     * Consumes an ICE transport's state-change notification (was the "statechange" callables
+     * registered on the transport).
+     */
+    #[\Override]
+    public function onIceTransportStateChange(IceTransportState $state): void
+    {
+        $this->updateIceConnectionState();
+        $this->updateConnectionState();
+    }
+
+    /**
+     * Consumes a DTLS transport's state-change notification (was the "statechange" callable
+     * registered on the transport).
+     */
+    #[\Override]
+    public function onDtlsTransportStateChange(): void
+    {
+        $this->updateConnectionState();
+    }
+
+    /**
+     * Gets the current connection state.
+     *
+     * @return ConnectionState The current connection state
+     */
+    #[Override]
+    public function getConnectionState(): ConnectionState
+    {
+        return $this->connectionState;
+    }
+
+    /**
+     * Sets the connection state and emits "connectionstatechange" event if changed.
+     *
+     * @param ConnectionState $connectionState The new connection state
+     */
+    public function setConnectionState(ConnectionState $connectionState): void
+    {
+        $this->connectionState = $connectionState;
+    }
+
+    /**
+     * Gets the current ICE connection state.
+     *
+     * @return IceConnectionState The current ICE connection state
+     */
+    #[Override]
+    public function getIceConnectionState(): IceConnectionState
+    {
+        return $this->iceConnectionState;
+    }
+
+    /**
+     * Sets the ICE connection state and emits "iceconnectionstatechange" event if changed.
+     *
+     * @param IceConnectionState $iceConnectionState The new ICE connection state
+     */
+    public function setIceConnectionState(IceConnectionState $iceConnectionState): void
+    {
+        $this->iceConnectionState = $iceConnectionState;
+    }
+
+    /**
+     * Gets the current ICE gathering state.
+     *
+     * @return IceGatheringState The current ICE gathering state
+     */
+    #[Override]
+    public function getIceGatheringState(): IceGatheringState
+    {
+        return $this->iceGatheringState;
+    }
+
+    /**
+     * Sets the ICE gathering state and emits "icegatheringstatechange" event if changed.
+     *
+     * @param IceGatheringState $iceGatheringState The new ICE gathering state
+     */
+    public function setIceGatheringState(IceGatheringState $iceGatheringState): void
+    {
+        $this->iceGatheringState = $iceGatheringState;
+    }
+
+    /**
+     * Gets the local description of the connection.
+     *
+     * @return RtcSessionDescription|null The local session description or null if not set
+     */
+    #[Override]
+    public function getLocalDescription(): ?RtcSessionDescription
+    {
+        $sdp = $this->pendingLocalDescription ?? $this->currentLocalDescription ?? null;
+        if (!$sdp) {
+            return null;
+        }
+        $type = $sdp->getType();
+        if ($type === null) {
+            throw new RuntimeException("Local description has no type");
+        }
+
+        return new RtcSessionDescription((string)$sdp, $type);
+    }
+
+    /**
+     * Gets the remote description of the connection.
+     *
+     * @return RtcSessionDescription|null The remote session description or null if not set
+     */
+    #[Override]
+    public function getRemoteDescription(): ?RtcSessionDescription
+    {
+        $sdp = $this->pendingRemoteDescription ?? $this->currentRemoteDescription ?? null;
+        if (!$sdp) {
+            return null;
+        }
+        $type = $sdp->getType();
+        if ($type === null) {
+            throw new RuntimeException("Remote description has no type");
+        }
+
+        return new RtcSessionDescription((string)$sdp, $type);
+    }
+
+    /**
+     * Gets the SCTP transport used for data channels.
+     *
+     * @return RTCSctpTransport|null The SCTP transport or null if not established
+     */
+    public function getSctp(): ?RTCSctpTransport
+    {
+        return $this->sctp;
+    }
+
+    /**
+     * Sets the SCTP transport for data channels.
+     *
+     * @param RTCSctpTransport|null $sctp The SCTP transport to set
+     */
+    public function setSctp(?RTCSctpTransport $sctp): void
+    {
+        $this->sctp = $sctp;
+    }
+
+    /**
+     * Gets the current signaling state.
+     *
+     * @return SignalingState The current signaling state
+     */
+    #[Override]
+    public function getSignalingState(): SignalingState
+    {
+        return $this->signalingState;
+    }
+
+    /**
+     * Sets the signaling state and emits "signalingstatechange" event.
+     *
+     * @param SignalingState $signalingState The new signaling state
+     */
+    public function setSignalingState(SignalingState $signalingState): void
+    {
+        $this->signalingState = $signalingState;
+        $this->notifySignalingStateChange();
+    }
+
+    /**
+     * Sets a logger for debugging purposes.
+     *
+     * @param LoggerInterface $logger The logger instance
+     */
+    public function setLogger(LoggerInterface $logger): void
+    {
+        $this->logger = $logger;
+    }
+
+    /**
+     * Adds an ICE candidate received from the remote peer.
+     *
+     * @param RTCIceCandidate $candidate The ICE candidate to add
+     * @throws InvalidArgumentException If a candidate is missing required fields
+     */
+    #[Override]
+    public function addIceCandidate(RTCIceCandidate $candidate): void
+    {
+        $mid = $candidate->getSdpMid();
+        $index = $candidate->getSdpMLineIndex();
+        if ($mid === null && $index === null) {
+            throw new InvalidArgumentException("Candidate must have either sdpMid or sdpMLineIndex");
+        }
+
+        // As in WebRTC, the sdpMid identifies the media section, falling back to the sdpMLineIndex.
+        // A bundled media section already uses the transport of its BUNDLE group.
+        $dtlsTransport = $mid !== null ? $this->getDtlsTransportByMid($mid) : $this->getDtlsTransportByMLineIndex($index);
+        if ($dtlsTransport === null) {
+            // Dropping it would leave ICE without the remote candidate to check.
+            throw new InvalidArgumentException($mid !== null
+                ? "No media section with mid $mid for the candidate"
+                : "No media section at index $index for the candidate");
+        }
+        $dtlsTransport->getIceTransport()->addRemoteCandidate($candidate);
+    }
+
+    /**
+     * Gets the transport of the media section with the specified mid.
+     */
+    private function getDtlsTransportByMid(int $mid): ?RTCDtlsTransport
+    {
+        foreach ($this->transceivers as $transceiver) {
+            if ($transceiver->getMid() === (string) $mid) {
+                return $this->requireDtlsTransport($transceiver->getDtlsTransport());
+            }
+        }
+        if ($this->sctp && $this->sctp->getMid() === (string) $mid) {
+            return $this->requireDtlsTransport($this->sctp->getDtlsTransport());
+        }
+        return null;
+    }
+
+    /**
+     * Gets the transport of the media section at the specified index.
+     */
+    private function getDtlsTransportByMLineIndex(int $index): ?RTCDtlsTransport
+    {
+        $transceiver = $this->getTransceiverByMLineIndex($index);
+        if ($transceiver !== null) {
+            return $this->requireDtlsTransport($transceiver->getDtlsTransport());
+        }
+        $description = $this->pendingRemoteDescription ?? $this->currentRemoteDescription;
+        if ($this->sctp && ($description?->getMedia()[$index] ?? null)?->getKind() === "application") {
+            return $this->requireDtlsTransport($this->sctp->getDtlsTransport());
+        }
+        return null;
+    }
+
+    /**
+     * Adds a media track to be sent to the remote peer.
+     *
+     * @param MediaStreamTrack $track The media track to add
+     * @return RTCRtpSender The sender associated with the track
+     * @throws OpenSSLException
+     * @throws RandomException
+     * @throws SrtpException
+     */
+    #[Override]
+    public function addTrack(MediaStreamTrack $track): RTCRtpSender
+    {
+        $this->checkNotClosed();
+
+        if (!in_array($track->getKind(), [MediaKind::Audio, MediaKind::Video])) {
+            throw new InvalidArgumentException("Invalid track kind {$track->getKind()->value}");
+        }
+
+        $this->checkTrackHasNoSender($track);
+
+        foreach ($this->transceivers as $transceiver) {
+            if ($transceiver->getKind() === $track->getKind() && !$transceiver->getSender()->getTrack()) {
+                $transceiver->getSender()->replaceTrack($track);
+                $direction = $transceiver->getDirection();
+                assert($direction !== null);
+                $transceiver->setDirection(SDPDirections::from($direction->value | SDPDirections::sendonly->value));
+                return $transceiver->getSender();
+            }
+        }
+        $transceiver = $this->createTransceiver($track->getKind(), SDPDirections::sendrecv, $track);
+
+        return $transceiver->getSender();
+    }
+
+    /**
+     * Adds a new transceiver to the connection.
+     *
+     * @param MediaKind|MediaStreamTrack $trackOrKind Either a media kind or track
+     * @param SDPDirections $direction The direction of the transceiver
+     * @return RTCRtpTransceiver The created transceiver
+     * @throws OpenSSLException
+     * @throws RandomException
+     * @throws SrtpException
+     */
+    #[Override]
+    public function addTransceiver(MediaKind|MediaStreamTrack $trackOrKind, SDPDirections $direction = SDPDirections::sendrecv): RTCRtpTransceiver
+    {
+        $this->checkNotClosed();
+
+        if ($trackOrKind instanceof MediaStreamTrack) {
+            $kind = $trackOrKind->getKind();
+            $track = $trackOrKind;
+        } else {
+            $kind = $trackOrKind;
+            $track = null;
+        }
+
+        if (!in_array($kind, [MediaKind::Audio, MediaKind::Video])) {
+            throw new RuntimeException("Invalid track kind $kind->value");
+        }
+
+        if ($track) {
+            $this->checkTrackHasNoSender($track);
+        }
+
+        return $this->createTransceiver($kind, $direction, $track);
+    }
+
+    /**
+     * Closes the peer connection and terminates all transports.
+     *
+     * @throws OpenSSLException
+     * @throws SrtpException If there's an error stopping SRTP
+     * @throws TLSException
+     * @throws SSLException
+     * @throws SysCallException
+     * @throws ZeroReturnException
+     */
+    #[Override]
+    public function close(): void
+    {
+        if ($this->isClosed) {
+            return;
+        }
+
+        foreach ($this->transceivers as $transceiver) {
+            $transceiver->stop();
+            $dtlsTransport = $this->requireDtlsTransport($transceiver->getDtlsTransport());
+            $dtlsTransport->stop();
+            $this->requireIceTransport($dtlsTransport->getIceTransport())->stop();
+        }
+
+        if (isset($this->sctp)) {
+            $this->sctp->stop();
+            // An in-band association shares the first transceiver's transport, stopped above.
+            if (!$this->sctpInband) {
+                $dtlsTransport = $this->requireDtlsTransport($this->sctp->getDtlsTransport());
+                $dtlsTransport->stop();
+                $this->requireIceTransport($dtlsTransport->getIceTransport())->stop();
+            }
+        }
+
+        $this->isClosed = true;
+        $this->setSignalingState(SignalingState::closed);
+
+        $this->updateIceGatheringState();
+        $this->updateIceConnectionState();
+        $this->updateConnectionState();
+
+        /** @var \WeakMap<PeerConnectionTrackListener, null> */
+        $this->trackListeners = new \WeakMap();
+        /** @var \WeakMap<PeerConnectionDataChannelListener, null> */
+        $this->peerConnectionDataChannelListeners = new \WeakMap();
+        /** @var \WeakMap<PeerConnectionSignalingStateChangeListener, null> */
+        $this->signalingStateChangeListeners = new \WeakMap();
+        /** @var \WeakMap<PeerConnectionConnectionStateChangeListener, null> */
+        $this->connectionStateChangeListeners = new \WeakMap();
+        /** @var \WeakMap<PeerConnectionIceConnectionStateChangeListener, null> */
+        $this->iceConnectionStateChangeListeners = new \WeakMap();
+        /** @var \WeakMap<PeerConnectionIceGatheringStateChangeListener, null> */
+        $this->iceGatheringStateChangeListeners = new \WeakMap();
+    }
+
+    /**
+     * Creates an SDP answer to a remote offer.
+     *
+     * @return RTCSessionDescription The answer
+     * @throws InvalidArgumentException If called in invalid signaling state
+     */
+    #[Override]
+    public function createAnswer(): RTCSessionDescription
+    {
+        $this->checkNotClosed();
+
+        if (!in_array($this->signalingState, [SignalingState::haveRemoteOffer, SignalingState::haveLocalPranswer])) {
+            throw new InvalidArgumentException("Cannot create answer in signaling state {$this->signalingState->name}");
+        }
+
+        [$sessionDescription, $groupDescription] = $this->initSessionDescription("answer");
+
+        $remoteDescription = $this->pendingRemoteDescription ?? $this->currentRemoteDescription;
+        if ($remoteDescription === null) {
+            throw new InvalidArgumentException("Cannot create answer: no remote description is set");
+        }
+
+        foreach ($remoteDescription->getMedia() as $remoteMediaStream) {
+            if (in_array($remoteMediaStream->getKind(), ["audio", "video"])) {
+                $transceiver = $this->getTransceiverByMid($remoteMediaStream->getRtp()->muxId);
+                if ($transceiver === null) {
+                    throw new RuntimeException("Cannot create answer: no transceiver found for mid {$remoteMediaStream->getRtp()->muxId}");
+                }
+                $mediaDescription = $this->createMediaDescriptionForTransceiver($transceiver);
+                $dtlsTransport = $this->requireDtlsTransport($transceiver->getDtlsTransport());
+            } else {
+                if ($this->sctp === null) {
+                    throw new RuntimeException("Cannot create answer: no SCTP transport available");
+                }
+                $mediaDescription = $this->createMediaDescriptionForSctp();
+                $dtlsTransport = $this->requireDtlsTransport($this->sctp->getDtlsTransport());
+            }
+
+            $dtls = $mediaDescription->getDtls();
+            if ($dtls === null) {
+                throw new RuntimeException("Cannot create answer: media description has no DTLS parameters");
+            }
+            $dtls->role = $dtlsTransport->getRole() == DtlsRole::Auto ? DtlsRole::Client : $dtlsTransport->getRole();
+            $sessionDescription->addMedia($mediaDescription);
+            $groupDescription->items[] = $mediaDescription->getRtp()->muxId;
+        }
+
+        $sessionDescription->addGroup($groupDescription);
+
+        $type = $sessionDescription->getType();
+        if ($type === null) {
+            throw new RuntimeException("Cannot create answer: no description type available");
+        }
+
+        return new RTCSessionDescription((string)$sessionDescription, $type);
+    }
+
+    /**
+     * Creates a media description for a transceiver.
+     *
+     * @param RTCRtpTransceiver $transceiver The transceiver to describe
+     * @param string|null $mid The media identifier
+     * @return MediaDescription The created media description
+     * @throws OpenSSLException
+     */
+    private function createMediaDescriptionForTransceiver(RTCRtpTransceiver $transceiver, ?string $mid = null): MediaDescription
+    {
+        $payloadTypes = [];
+        foreach ($transceiver->getCodecs() as $codec) {
+            assert($codec->payloadType !== null);
+            $payloadTypes[] = $codec->payloadType;
+        }
+
+        $mediaDescription = new MediaDescription(
+            $transceiver->getKind()->value,
+            self::DISCARD_PORT,
+            "UDP/TLS/RTP/SAVPF",
+            $payloadTypes
+        );
+        $mediaDescription->setDirection($this->combinedDirection($transceiver));
+        $mediaDescription->setMsid("{$transceiver->getSender()->getStreamId()} {$transceiver->getSender()->getTrackId()}");
+        $midValue = $mid;
+        if ($midValue === null) {
+            $midValue = $transceiver->getMid();
+        }
+        if ($midValue === null) {
+            throw new RuntimeException("Unable to determine a media identifier for the transceiver");
+        }
+        /** @var list<RTCRtpHeaderExtensionParameters> $headerExtensions */
+        $headerExtensions = $transceiver->getHeaderExtensions();
+        $mediaDescription->setRtp(new RTCRtpParameters($transceiver->getCodecs(), $headerExtensions, $midValue));
+        $mediaDescription->setRtcpHost(self::DISCARD_HOST);
+        $mediaDescription->setRtcpPort(self::DISCARD_PORT);
+        $mediaDescription->setRtcpMux(true);
+        $mediaDescription->setSsrc([new SsrcDescription($transceiver->getSender()->getSsrc(), $this->cname)]);
+
+        $rtxCodecs = array_filter($mediaDescription->getRtp()->codecs, fn($codec) => CodecUtility::isRtx($codec));
+        if (!empty($rtxCodecs)) {
+            $mediaDescription->addSsrc(new SsrcDescription($transceiver->getSender()->getRtxSsrc(), $this->cname));
+            $mediaDescription->setSsrcGroup([new GroupDescription("FID", [$transceiver->getSender()->getSsrc(), $transceiver->getSender()->getRtxSsrc()])]);
+        }
+
+        $this->addTransportDescription($mediaDescription, $this->requireDtlsTransport($transceiver->getDtlsTransport()));
+
+        return $mediaDescription;
+    }
+
+    /**
+     * Adds transport information to a media description.
+     *
+     * @param MediaDescription $mediaDescription The description to augment
+     * @param RTCDtlsTransport $dtlsTransport The transport to describe
+     * @throws OpenSSLException
+     */
+    private function addTransportDescription(MediaDescription $mediaDescription, RTCDtlsTransport $dtlsTransport): void
+    {
+        // ice
+        $iceTransport = $dtlsTransport->getIceTransport();
+        $iceGatherer = $iceTransport->getIceGatherer();
+        $mediaDescription->setIceCandidates($iceGatherer->getLocalCandidates());
+        $mediaDescription->setIceCandidatesComplete($iceGatherer->getState() === IceGatheringState::complete);
+        $mediaDescription->setIce($iceGatherer->getLocalParameters());
+
+        if (!empty($mediaDescription->getIceCandidates())) {
+            $mediaDescription->setHost($mediaDescription->getIceCandidates()[0]->getHost());
+            $mediaDescription->setPort($mediaDescription->getIceCandidates()[0]->getPort());
+        } else {
+            $mediaDescription->setHost(self::DISCARD_HOST);
+            $mediaDescription->setPort(self::DISCARD_PORT);
+        }
+
+        // dtls
+        $dtls = $mediaDescription->getDtls();
+        if ($dtls === null) {
+            $mediaDescription->setDtls($dtlsTransport->getLocalParameters());
+        } else {
+            $dtls->fingerprints = $dtlsTransport->getLocalParameters()->fingerprints;
+        }
+    }
+
+    /**
+     * Gets a transceiver by its media identifier.
+     *
+     * @param string $muxId The media identifier
+     * @return RTCRtpTransceiver|null The transceiver or null if not found
+     */
+    private function getTransceiverByMid(string $muxId): ?RTCRtpTransceiver
+    {
+        /** @var RTCRtpTransceiver|null $result */
+        $result = array_find($this->transceivers, fn(RTCRtpTransceiver $transceiver) => $transceiver->getMid() === $muxId);
+
+        return $result;
+    }
+
+    /**
+     * Gets a transceiver by its media line index.
+     *
+     * @param int $index The media line index
+     * @return RTCRtpTransceiver|null The transceiver or null if not found
+     */
+    private function getTransceiverByMLineIndex(int $index): ?RTCRtpTransceiver
+    {
+        /** @var RTCRtpTransceiver|null $result */
+        $result = array_find($this->transceivers, fn(RTCRtpTransceiver $transceiver) => $transceiver->getMlineIndex() === $index);
+
+        return $result;
+    }
+
+    /**
+     * Computes the direction resulting from intersecting a transceiver direction with its offer direction.
+     *
+     * @param RTCRtpTransceiver $transceiver The transceiver to evaluate
+     * @return SDPDirections The combined direction
+     */
+    private function combinedDirection(RTCRtpTransceiver $transceiver): SDPDirections
+    {
+        $offerDirection = $transceiver->getOfferDirection();
+        if ($offerDirection === null) {
+            $offerDirection = SDPDirections::sendrecv;
+        }
+
+        $currentDirection = $transceiver->getDirection();
+        assert($currentDirection !== null);
+
+        return SDPDirections::from($currentDirection->value & $offerDirection->value);
+    }
+
+    /**
+     * Creates a media description for the SCTP transport.
+     *
+     * @param string|null $mid The media identifier
+     * @return MediaDescription The created media description
+     * @throws OpenSSLException
+     */
+    private function createMediaDescriptionForSctp(?string $mid = null): MediaDescription
+    {
+        if ($this->sctp === null) {
+            throw new RuntimeException("SCTP transport is not available");
+        }
+
+        if ($this->sctpLegacySdp) {
+            $mediaDescription = new MediaDescription("application", self::DISCARD_PORT, "DTLS/SCTP", [$this->sctp->getPort()]);
+            $mediaDescription->setSctpMap([$this->sctp->getPort() => "webrtc-datachannel {$this->sctp->getOutboundStreamsCount()}"]);
+        } else {
+            $mediaDescription = new MediaDescription("application", self::DISCARD_PORT, "UDP/DTLS/SCTP", ["webrtc-datachannel"]);
+            $mediaDescription->setSctpPort($this->sctp->getPort());
+        }
+
+        $muxId = $mid;
+        if ($muxId === null) {
+            $muxId = $this->sctp->getMid();
+        }
+        if ($muxId === null) {
+            throw new RuntimeException("Unable to determine a media identifier for the SCTP transport");
+        }
+        $mediaDescription->getRtp()->muxId = $muxId;
+        $mediaDescription->setSctpCapabilities($this->sctp->getCapabilities());
+
+        $this->addTransportDescription($mediaDescription, $this->requireDtlsTransport($this->sctp->getDtlsTransport()));
+
+        return $mediaDescription;
+    }
+
+    /**
+     * Creates a data channel for sending arbitrary data.
+     *
+     * @param RTCDataChannelParameters $parameters Configuration for the data channel
+     * @return RTCDataChannel The created data channel
+     * @throws OpenSSLException
+     * @throws RandomException
+     * @throws SctpException
+     * @throws SrtpException
+     */
+    #[Override]
+    public function createDataChannel(RTCDataChannelParameters $parameters): RTCDataChannel
+    {
+        if ($parameters->maxPacketLifeTime !== null && $parameters->maxRetransmits !== null) {
+            throw new InvalidArgumentException("Cannot specify both maxPacketLifeTime and maxRetransmits");
+        }
+
+        if (!$this->sctp) {
+            $this->createSctpTransport();
+        }
+
+        if ($this->sctp === null) {
+            throw new RuntimeException("Unable to create the SCTP transport");
+        }
+
+        return new RTCDataChannel($this->sctp, $parameters);
+    }
+
+    /**
+     * Run the SCTP association in-band over the media transport, outside SDP.
+     *
+     * Standard WebRTC negotiates data channels through an `m=application` section; tgcalls (both in
+     * one-to-one calls and towards the group call SFU) instead opens an SCTP association straight
+     * over the DTLS transport that carries the media, with fixed ports and no SDP at all. This sets
+     * that up: the association is bound to the first transceiver's DTLS transport (the BUNDLE master),
+     * is never described in offers or answers, and starts as soon as that transport connects.
+     * Data channels are then created with {@see self::createDataChannel()} as usual, or arrive from
+     * the peer through the data channel listener.
+     *
+     * @param bool|null $client Whether to initiate the association (and open the channels): true or
+     *                          false to force it, null to follow the ICE role like standard WebRTC.
+     * @param int       $remotePort The peer's SCTP port.
+     * @throws RuntimeException If no transceiver exists yet to carry the association, or SCTP is
+     *                          already set up through SDP.
+     */
+    public function createInbandSctp(?bool $client = null, int $remotePort = 5000): void
+    {
+        $this->checkNotClosed();
+        if ($this->sctp !== null) {
+            if ($this->sctpInband) {
+                return;
+            }
+            throw new RuntimeException("The SCTP association is already negotiated through SDP");
+        }
+        $master = $this->transceivers[0] ?? null;
+        if ($master === null) {
+            throw new RuntimeException("An in-band SCTP association needs a transceiver whose transport it can share");
+        }
+        $this->sctp = new RTCSctpTransport($this->requireDtlsTransport($master->getDtlsTransport()));
+        $this->sctp->setLogger($this->logger);
+        $this->sctp->addDataChannelListener($this);
+        $this->sctp->setBundled(true);
+        $this->sctp->setClientRole($client);
+        $this->sctpInband = true;
+        $this->sctpRemotePort = $remotePort;
+        $this->scheduleConnect();
+    }
+
+    /**
+     * Whether the SCTP association runs in-band (see {@see self::createInbandSctp()}).
+     */
+    public function isSctpInband(): bool
+    {
+        return $this->sctpInband;
+    }
+
+    /**
+     * Creates an SCTP transport if none exists.
+     *
+     * @throws OpenSSLException
+     * @throws RandomException If random number generation fails
+     * @throws SctpException If SCTP transport creation fails
+     * @throws SrtpException
+     */
+    private function createSctpTransport(): void
+    {
+        $this->sctp = new RTCSctpTransport($this->createDtlsTransport());
+        $this->sctp->setLogger($this->logger);
+
+        $this->sctp->addDataChannelListener($this);
+    }
+
+    /**
+     * Re-emit a remotely-opened data channel to application listeners (was the re-emitted
+     * 'datachannel' event). Typed replacement registered via addDataChannelListener().
+     */
+    #[\Override]
+    public function onDataChannel(RTCDataChannel $channel): void
+    {
+        $this->notifyPeerConnectionDataChannel($channel);
+    }
+
+    /**
+     * Creates a DTLS transport.
+     *
+     * @return RTCDtlsTransport The created DTLS transport
+     * @throws OpenSSLException If SSL operation fails
+     * @throws RandomException|SrtpException If random number generation fails
+     */
+    private function createDtlsTransport(): RTCDtlsTransport
+    {
+        if ($this->configuration === null) {
+            throw new RuntimeException("Connection configuration is not available");
+        }
+
+        // create ICE transport
+        $iceServers = [];
+        foreach ($this->configuration->getIceServers() as $iceServer) {
+            assert($iceServer instanceof RTCIceServer);
+            $iceServers[] = $iceServer;
+        }
+
+        $iceGatherer = new RTCIceGatherer($iceServers, $this->configuration->iceSettings(), $this->logger);
+        $iceGatherer->addStateChangeListener($this);
+        $iceTransport = new RTCIceTransport($iceGatherer, $this->logger);
+        $iceTransport->addStateChangeListener($this);
+        $this->iceTransports[spl_object_id($iceTransport)] = $iceTransport;
+
+        // create DTLS transport
+        $dtlsTransport = new RTCDtlsTransport($iceTransport, $this->certificates[0]);
+        $dtlsTransport->setLogger($this->logger);
+        $dtlsTransport->addStateChangeListener($this);
+        $this->dtlsTransports[spl_object_id($dtlsTransport)] = $dtlsTransport;
+
+        //update states
+        $this->updateIceGatheringState();
+        $this->updateIceConnectionState();
+        $this->updateConnectionState();
+
+        return $dtlsTransport;
+    }
+
+    /**
+     * Creates an SDP offer to initiate a connection.
+     *
+     * @return RTCSessionDescription The offer
+     * @throws RuntimeException If called with no media or data channels
+     */
+    #[Override]
+    public function createOffer(): RTCSessionDescription
+    {
+        $this->checkNotClosed();
+
+        if (!$this->sctp && empty($this->transceivers)) {
+            throw new RuntimeException("Cannot create an offer with no media and no data channels");
+        }
+
+        $codec = new Codec();
+        foreach ($this->transceivers as $transceiver) {
+            /** @var list<RTCRtpCodecParameters> $codecs */
+            $codecs = $codec->getCodecs($transceiver->getKind()->value);
+            /** @var list<RTCRtpCodecCapability> $preferredCodecs */
+            $preferredCodecs = $transceiver->getPreferredCodecs();
+            $transceiver->setCodecs($this->findPreferredCodecs($codecs, $preferredCodecs));
+            $headerExtensions = [];
+            foreach ($codec->getHeaderExtensions($transceiver->getKind()->value) as $extension) {
+                $headerExtensions[] = $extension;
+            }
+            $transceiver->setHeaderExtensions($headerExtensions);
+        }
+        $mids = $this->seenMids;
+
+        [$sessionDescription, $groupDescription] = $this->initSessionDescription("offer");
+
+        $remoteDescriptionMedias = ($this->pendingRemoteDescription ?? $this->currentRemoteDescription)?->getMedia() ?? [];
+        $localDescriptionMedias = ($this->pendingLocalDescription ?? $this->currentLocalDescription)?->getMedia() ?? [];
+
+        for ($i = 0; $i < max(count($remoteDescriptionMedias), count($localDescriptionMedias)); $i++) {
+            $mediaDescription = null;
+            $mediaInSection = null;
+            if (isset($localDescriptionMedias[$i])) {
+                $mediaInSection = $localDescriptionMedias[$i];
+            } elseif (isset($remoteDescriptionMedias[$i])) {
+                $mediaInSection = $remoteDescriptionMedias[$i];
+            }
+            $mediaKind = $mediaInSection?->getKind();
+            $mid = $mediaInSection?->getRtp()->muxId;
+            if (in_array($mediaKind, ["audio", "video"])) {
+                $mediaIndex = $mid;
+                if ($mediaIndex === null) {
+                    throw new RuntimeException("Media section has no media identifier");
+                }
+                $transceiver = $this->getTransceiverByMid($mediaIndex);
+                if ($transceiver === null) {
+                    throw new RuntimeException("No transceiver found for media identifier {$mediaIndex}");
+                }
+                $transceiver->setMlineIndex($i);
+                $mediaDescription = $this->createMediaDescriptionForTransceiver($transceiver, $mediaIndex);
+            } elseif ($mediaKind == "application") {
+                $mediaDescription = $this->createMediaDescriptionForSctp($mid);
+            }
+
+            if (isset($mediaDescription)) {
+                $sessionDescription->addMedia($mediaDescription);
+            }
+        }
+
+        foreach ($this->transceivers as $transceiver) {
+            if ($transceiver->getMid() === null && !$transceiver->isStopped()) {
+                $transceiver->setMlineIndex(count($sessionDescription->getMedia()));
+                $sessionDescription->addMedia($this->createMediaDescriptionForTransceiver($transceiver, $this->getFreeMid($mids)));
+            }
+        }
+
+        if ($this->sctp && !$this->sctpInband && $this->sctp->getMid() === null) {
+            $sessionDescription->addMedia($this->createMediaDescriptionForSctp($this->getFreeMid($mids)));
+        }
+
+        foreach ($sessionDescription->getMedia() as $media) {
+            $groupDescription->items[] = $media->getRtp()->muxId;
+        }
+        $sessionDescription->addGroup($groupDescription);
+
+        $type = $sessionDescription->getType();
+        if ($type === null) {
+            throw new RuntimeException("Failed to generate the offer description type");
+        }
+
+        return new RTCSessionDescription((string)$sessionDescription, $type);
+    }
+
+    /**
+     * Initializes a new session description.
+     *
+     * @param string $type The description type (offer/answer)
+     * @return array{SessionDescription, GroupDescription} The session and group descriptions
+     */
+    private function initSessionDescription(string $type): array
+    {
+        $ntpSeconds = NetworkTimeProtocol::currentMs() >> 3;
+
+        $sessionDescription = new SessionDescription();
+        $sessionDescription->setOrigin("- $ntpSeconds $ntpSeconds IN IP4 0.0.0.0");
+        $sessionDescription->appendMsidSemantic(new GroupDescription("WMS", ["*"]));
+        $sessionDescription->setType($type);
+
+        $groupDescription = new GroupDescription("BUNDLE", []);
+
+        return [$sessionDescription, $groupDescription];
+    }
+
+    /**
+     * Finds an unused media identifier.
+     *
+     * @param array $mids Array of used media identifiers
+     * @return string The next available media identifier
+     */
+    private function getFreeMid(array &$mids): string
+    {
+        $i = 0;
+        while (True) {
+            if (!isset($mids[$i])) {
+                $mids[$i] = true;
+                return (string)$i;
+            }
+            $i += 1;
+        }
+    }
+
+    /**
+     * Gets all RTP receivers attached to the connection.
+     *
+     * @return array<RTCRtpReceiver> Array of RTP receivers
+     */
+    #[Override]
+    public function getReceivers(): array
+    {
+        return array_map(fn($transceiver) => $transceiver->getReceiver(), $this->transceivers);
+    }
+
+    /**
+     * Gets all RTP senders attached to the connection.
+     *
+     * @return list<RTCRtpSender> Array of RTP senders
+     */
+    #[Override]
+    public function getSenders(): array
+    {
+        return array_map(fn($transceiver) => $transceiver->getSender(), $this->transceivers);
+    }
+
+    /**
+     * Gets statistics for the connection.
+     *
+     * @return RTCStatsReport The statistics report
+     */
+    #[Override]
+    public function getStats(): RTCStatsReport
+    {
+        $report = new RTCStatsReport();
+
+        $senders = $this->getSenders();
+        $receivers = $this->getReceivers();
+
+        foreach ($senders as $sender) {
+            $report->merge($sender->getStats());
+        }
+
+        foreach ($receivers as $receiver) {
+            $report->merge($receiver->getStats());
+        }
+
+        return $report;
+    }
+
+    /**
+     * Gets all transceivers attached to the connection.
+     *
+     * @return array<RTCRtpTransceiver> Array of transceivers
+     */
+    public function getTransceivers(): array
+    {
+        return $this->transceivers;
+    }
+
+    /**
+     * Sets the local description for the connection.
+     *
+     * @param RTCSessionDescription $rtcSessionDescription The description to set
+     * @return void Returns once complete
+     */
+    #[Override]
+    public function setLocalDescription(RTCSessionDescription $rtcSessionDescription): void
+    {
+        $this->debug(sprintf("setLocalDescription(%s)\n%s", $rtcSessionDescription->getType(), $rtcSessionDescription->getSdp()));
+
+        if ($rtcSessionDescription->getType() === "rollback") {
+            if (!in_array($this->signalingState, [SignalingState::haveLocalOffer, SignalingState::haveRemotePranswer])) {
+                throw new InvalidArgumentException("Cannot roll back a local description in signaling state \"" . $this->signalingState->name . "\"");
+            }
+            $this->pendingLocalDescription = null;
+            $this->setSignalingState(SignalingState::stable);
+            return;
+        }
+
+        $sessionDescription = SessionDescription::decode($rtcSessionDescription->getSdp());
+        $sessionDescription->setType($rtcSessionDescription->getType());
+        $this->validateDescription($sessionDescription, true);
+
+        if ($sessionDescription->isType("offer")) {
+            $this->setSignalingState(SignalingState::haveLocalOffer);
+        } elseif ($sessionDescription->isType("answer")) {
+            $this->setSignalingState(SignalingState::stable);
+        }
+
+        foreach ($sessionDescription->getMedia() as $index => $media) {
+            $this->seenMids[$media->getRtp()->muxId] = true;
+
+            if (in_array($media->getKind(), ["audio", "video"])) {
+                $transceiver = $this->getTransceiverByMLineIndex((int)$index);
+                if ($transceiver === null) {
+                    throw new RuntimeException("No transceiver found for media line {$index}");
+                }
+                $transceiver->setMid($media->getRtp()->muxId);
+            } elseif ($media->getKind() === "application") {
+                if ($this->sctp === null) {
+                    throw new RuntimeException("No SCTP transport available for data channel media section");
+                }
+                $this->sctp->setMid($media->getRtp()->muxId);
+            }
+        }
+
+        if ($sessionDescription->isType("offer")) {
+            foreach ($this->iceTransports as $iceTransport) {
+                if (!$iceTransport->isRoleSet()) {
+                    $iceTransport->getIceConnection()->setIceRole(IceRole::Controlling);
+                    $iceTransport->setRoleSet(true);
+                }
+            }
+        }
+
+        if ($sessionDescription->isType("answer")) {
+            foreach ($sessionDescription->getMedia() as $index => $media) {
+                $dtls = $media->getDtls();
+                if ($dtls === null) {
+                    throw new RuntimeException("Media description has no DTLS parameters");
+                }
+                if (in_array($media->getKind(), ["audio", "video"])) {
+                    $transceiver = $this->getTransceiverByMLineIndex((int)$index);
+                    if ($transceiver === null) {
+                        throw new RuntimeException("No transceiver found for media line {$index}");
+                    }
+                    $dtlsTransport = $this->requireDtlsTransport($transceiver->getDtlsTransport());
+                } else {
+                    if ($this->sctp === null) {
+                        throw new RuntimeException("No SCTP transport available");
+                    }
+                    $dtlsTransport = $this->requireDtlsTransport($this->sctp->getDtlsTransport());
+                }
+                $dtlsTransport->setRole($dtls->role);
+            }
+        }
+
+        if (in_array($sessionDescription->getType(), ["answer", "pranswer"])) {
+            foreach ($this->transceivers as $transceiver) {
+                $transceiver->setCurrentDirection($this->combinedDirection($transceiver));
+            }
+        }
+        $this->gatherIceCandidates();
+
+        foreach ($sessionDescription->getMedia() as $index => $media) {
+            if (in_array($media->getKind(), ["audio", "video"])) {
+                $transceiver = $this->getTransceiverByMLineIndex((int)$index);
+                if ($transceiver === null) {
+                    throw new RuntimeException("No transceiver found for media line {$index}");
+                }
+                $this->addTransportDescription($media, $this->requireDtlsTransport($transceiver->getDtlsTransport()));
+            } elseif ($media->getKind() === "application") {
+                if ($this->sctp === null) {
+                    throw new RuntimeException("No SCTP transport available");
+                }
+                $this->addTransportDescription($media, $this->requireDtlsTransport($this->sctp->getDtlsTransport()));
+            }
+        }
+
+        if ($sessionDescription->isType("answer")) {
+            $this->currentLocalDescription = $sessionDescription;
+            $this->pendingLocalDescription = null;
+        } else {
+            $this->pendingLocalDescription = $sessionDescription;
+        }
+
+        $this->scheduleConnect();
+    }
+
+    /**
+     * Sets the remote description for the connection.
+     *
+     * @param RTCSessionDescription $sessionDescription The description to set
+     * @return void Returns once complete
+     */
+    #[Override]
+    public function setRemoteDescription(RTCSessionDescription $sessionDescription): void
+    {
+        $this->debug(sprintf("setRemoteDescription(%s)\n%s", $sessionDescription->getType(), $sessionDescription->getSdp()));
+        if ($sessionDescription->getType() === "rollback") {
+            if (!in_array($this->signalingState, [SignalingState::haveRemoteOffer, SignalingState::haveLocalPranswer])) {
+                throw new InvalidArgumentException("Cannot roll back a remote description in signaling state \"" . $this->signalingState->name . "\"");
+            }
+            $this->pendingRemoteDescription = null;
+            $this->setSignalingState(SignalingState::stable);
+            return;
+        }
+        $sdp = SessionDescription::decode($sessionDescription->getSdp());
+        $sdp->setType($sessionDescription->getType());
+        $this->validateDescription($sdp, false);
+        /** @var array<int, array{RTCIceTransportInterface, MediaDescription}> $iceCandidates */
+        $iceCandidates = [];
+        /** @var list<RTCTrackEvent|null> $trackEvents */
+        $trackEvents = [];
+        foreach ($sdp->getMedia() as $index => $media) {
+            $dtlsTransport = null;
+            $this->seenMids[$media->getRtp()->muxId] = true;
+            if (in_array($media->getKind(), ["audio", "video"])) {
+                [$trackEvents [], $dtlsTransport] = $this->getTrackEventAndDtlsTransport((int)$index, $media, $sdp);
+            } elseif ($media->getKind() === "application") {
+                $dtlsTransport = $this->getSctpDtlsTransport((int)$index, $media);
+            }
+
+            if (isset($dtlsTransport)) {
+                $this->handleTransports($this->requireDtlsTransport($dtlsTransport), $sdp, $media, $iceCandidates);
+            }
+        }
+        $bundleGroupDescriptions = array_filter($sdp->getGroup(), fn(GroupDescription $group) => $group->semantic === "BUNDLE");
+        $bundleGroupDescription = $bundleGroupDescriptions[0] ?? null;
+
+        if ($bundleGroupDescription && !empty($bundleGroupDescription->items)) {
+            $this->removeBundleTransport($bundleGroupDescription, $iceCandidates);
+        }
+
+        foreach ($iceCandidates as [$iceCandidate, $media]) {
+            $this->addRemoteCandidates($this->requireIceTransport($iceCandidate), $media);
+        }
+
+        foreach ($trackEvents as $trackEvent) {
+            if ($trackEvent !== null) {
+                $this->notifyTrack($trackEvent->track);
+            }
+        }
+
+        if ($sdp->isType("offer")) {
+            $this->setSignalingState(SignalingState::haveRemoteOffer);
+        } elseif ($sdp->isType("answer")) {
+            $this->setSignalingState(SignalingState::stable);
+
+        }
+
+        if ($sdp->isType("answer")) {
+            $this->currentRemoteDescription = $sdp;
+            $this->pendingRemoteDescription = null;
+        } else {
+            $this->pendingRemoteDescription = $sdp;
+        }
+
+        $this->scheduleConnect();
+
+    }
+
+    /**
+     * Gets a track event and DTLS transport for a media description.
+     *
+     * This method handles the negotiation and setup of a transceiver for a remote media description,
+     * including codec negotiation, direction configuration, and track creation.
+     *
+     * @param int $index The media line index in the SDP
+     * @param MediaDescription $media The media description from the remote SDP
+     * @param SessionDescription $sessionDescription The full session description
+     * @return array{RTCTrackEvent|null, RTCRTPDtlsTransportInterface|null} Tuple containing:
+     *         - The track event (if a new receiver track was created)
+     *         - The associated DTLS transport
+     * @throws OpenSSLException
+     * @throws RandomException
+     * @throws SrtpException
+     */
+    private function getTrackEventAndDtlsTransport(int $index, MediaDescription $media, SessionDescription $sessionDescription): array
+    {
+        $trackEvent = null;
+        $transceiver = null;
+        foreach ($this->transceivers as $trans) {
+            if ($trans->getKind()->value === $media->getKind() && ($trans->getMid() === null || $trans->getMid() == $media->getRtp()->muxId)) {
+                $transceiver = $trans;
+                break;
+            }
+        }
+
+        if (!$transceiver) {
+            $transceiver = $this->createTransceiver(MediaKind::from($media->getKind()), SDPDirections::recvonly);
+        }
+
+        if ($transceiver->getMid() === null) {
+            $transceiver->setMid($media->getRtp()->muxId);
+            $transceiver->setMlineIndex($index);
+        }
+
+        if ($media->getPort() === 0) {
+            if (in_array($sessionDescription->getType(), ["answer", "pranswer"])) {
+                $transceiver->setCurrentDirection(SDPDirections::inactive);
+            } else {
+                $transceiver->setOfferDirection(SDPDirections::inactive);
+            }
+            return [null, null];
+        }
+
+        $codec = new Codec();
+        // negotiate codecs
+        /** @var list<RTCRtpCodecParameters> $localCodecs */
+        $localCodecs = $codec->getCodecs($media->getKind());
+        /** @var list<RTCRtpCodecParameters> $remoteCodecs */
+        $remoteCodecs = $media->getRtp()->codecs;
+        /** @var list<RTCRtpCodecCapability> $preferredCodecs */
+        $preferredCodecs = $transceiver->getPreferredCodecs();
+        $mutual = $this->findPreferredCodecs($this->findMutualCodecs($localCodecs, $remoteCodecs), $preferredCodecs);
+        if (empty($mutual)) {
+            if ($media->getKind() === "video") {
+                // Video is optional: if the peer offers no codec we can also produce (for example we
+                // are playing a pre-encoded AV1 file but the peer only decodes VP8/VP9/H264), drop the
+                // video track instead of failing the whole call — the audio keeps working.
+                if (in_array($sessionDescription->getType(), ["answer", "pranswer"], true)) {
+                    $transceiver->setCurrentDirection(SDPDirections::inactive);
+                } else {
+                    $transceiver->setOfferDirection(SDPDirections::inactive);
+                }
+                return [null, null];
+            }
+            throw new RuntimeException("Failed to set remote {$media->getKind()} description send parameters");
+        }
+        $transceiver->setCodecs($mutual);
+        /** @var list<RTCRtpHeaderExtensionParameters> $localHeaderExtensions */
+        $localHeaderExtensions = $codec->getHeaderExtensions($media->getKind());
+        /** @var list<RTCRtpHeaderExtensionParameters> $remoteHeaderExtensions */
+        $remoteHeaderExtensions = $media->getRtp()->headerExtensions;
+        $transceiver->setHeaderExtensions($this->findMutualHeaderExtensions($localHeaderExtensions, $remoteHeaderExtensions));
+
+        // configure direction
+        $direction = $media->getDirection();
+        if ($direction === null) {
+            $direction = SDPDirections::sendrecv;
+        }
+        $direction = $this->reverseDirection($direction);
+        if (in_array($sessionDescription->getType(), ["answer", "pranswer"])) {
+            $transceiver->setCurrentDirection($direction);
+        } else {
+            $transceiver->setOfferDirection($direction);
+        }
+
+        // create remote stream track
+        if (in_array($direction, [SDPDirections::recvonly, SDPDirections::sendrecv]) && !$transceiver->getReceiver()->getTrack()) {
+            $track = new RemoteStreamTrack(MediaKind::from($media->getKind()), $sessionDescription->webrtcTrackId($media));
+            $transceiver->getReceiver()->setTrack($track);
+            $trackEvent = new RTCTrackEvent($transceiver->getReceiver(), $track, $transceiver);
+        }
+
+        // memorise transport parameters
+        $this->remoteDtlsParameter[spl_object_id($transceiver)] = $media->getDtls();
+        $this->remoteIceParameters[spl_object_id($transceiver)] = $media->getIce();
+
+        return [$trackEvent, $transceiver->getDtlsTransport()];
+    }
+
+    /**
+     * Creates a new RTCRtpTransceiver with the specified parameters.
+     *
+     * The transceiver includes both sender and receiver components and is automatically
+     * added to the connection's transceiver list.
+     *
+     * @param MediaKind $kind The media kind (audio/video)
+     * @param SDPDirections $direction The initial direction of the transceiver
+     * @param MediaStreamTrack|null $senderTrack Optional track for the sender component
+     * @return RTCRtpTransceiver The created transceiver
+     * @throws OpenSSLException
+     * @throws RandomException
+     * @throws SrtpException
+     */
+    private function createTransceiver(MediaKind $kind, SDPDirections $direction, ?MediaStreamTrack $senderTrack = null): RTCRtpTransceiver
+    {
+        $dtlsTransport = $this->createDtlsTransport();
+        $transceiver = new RTCRtpTransceiver($kind, new RTCRtpReceiver($kind, $dtlsTransport), new RTCRtpSender($senderTrack ?? $kind, $dtlsTransport));
+        $transceiver->setDirection($direction);
+        $transceiver->getReceiver()->setRtcpSsrc($transceiver->getSender()->getSsrc());
+        $transceiver->getSender()->setStreamId($this->streamId);
+        $transceiver->setDtlsTransport($dtlsTransport);
+
+        $this->transceivers[] = $transceiver;
+
+        return $transceiver;
+    }
+
+    /**
+     * Gets or creates the SCTP transport's DTLS transport for a media description.
+     *
+     * This handles SCTP-specific SDP negotiation including legacy SDP format detection
+     * and port configuration.
+     *
+     * @param int $index The media line index in the SDP
+     * @param MediaDescription $media The media description from the remote SDP
+     * @return RTCDtlsTransport The DTLS transport for the SCTP association
+     * @throws OpenSSLException
+     * @throws RandomException
+     * @throws SctpException
+     * @throws SrtpException
+     */
+    private function getSctpDtlsTransport(int $index, MediaDescription $media): RTCDtlsTransport
+    {
+        if (!$this->sctp) {
+            $this->createSctpTransport();
+        }
+
+        if ($this->sctp === null) {
+            throw new RuntimeException("Unable to create the SCTP transport");
+        }
+
+        if ($this->sctp->getMid() === null) {
+            $this->sctp->setMid($media->getRtp()->muxId);
+        }
+
+        // configure sctp
+        if ($media->getProfile() === "DTLS/SCTP") {
+            $this->sctpLegacySdp = true;
+            // Legacy DTLS/SCTP carries the SCTP port as the m-line fmt token. A bare (int) cast
+            // would turn a malformed value into port 0 and fail opaquely later; validate it.
+            $sctpPort = (string)($media->getFmt()[0] ?? '');
+            if (!ctype_digit($sctpPort)) {
+                throw new InvalidArgumentException("Invalid legacy DTLS/SCTP port in SDP: \"$sctpPort\"");
+            }
+            $this->sctpRemotePort = (int)$sctpPort;
+        } else {
+            $this->sctpLegacySdp = false;
+            $this->sctpRemotePort = $media->getSctpPort();
+        }
+
+        // memorise transport parameters
+        $this->remoteDtlsParameter[spl_object_id($this->sctp)] = $media->getDtls();
+        $this->remoteIceParameters[spl_object_id($this->sctp)] = $media->getIce();
+
+        return $this->requireDtlsTransport($this->sctp->getDtlsTransport());
+    }
+
+    /**
+     * Configures ICE and DTLS transports based on session and media descriptions.
+     *
+     * This method handles:
+     * - Setting ICE roles (controlling/controlled) based on offer/answer
+     * - Configuring DTLS roles (client/server) based on remote parameters
+     * - Tracking ICE candidates for later processing
+     *
+     * @param RTCDtlsTransport $dtlsTransport The DTLS transport to configure
+     * @param SessionDescription $sessionDescription The session description
+     * @param MediaDescription $media The media description
+     * @param array<int, array{RTCIceTransportInterface, MediaDescription}> $iceCandidates Reference to array storing ICE candidates
+     * @param-out array<int, array{RTCIceTransportInterface, MediaDescription}> $iceCandidates
+     */
+    private function handleTransports(RTCDtlsTransport $dtlsTransport, SessionDescription $sessionDescription, MediaDescription $media, array &$iceCandidates): void
+    {
+        // add ICE candidates
+        $iceTransport = $dtlsTransport->getIceTransport();
+
+        // set an ICE role
+        $mediaIce = $media->getIce();
+        if ($sessionDescription->isType("offer") && !$iceTransport->isRoleSet()) {
+            if ($mediaIce === null) {
+                throw new RuntimeException("Media description has no ICE parameters");
+            }
+            $iceTransport->getIceConnection()->setIceRole($mediaIce->iceLite ? IceRole::Controlling : IceRole::Controlled);
+            $iceTransport->setRoleSet(true);
+        }
+
+        // set DTLS role
+        $mediaDtls = $media->getDtls();
+        if ($mediaDtls === null) {
+            throw new RuntimeException("Media description has no DTLS parameters");
+        }
+        if ($sessionDescription->isType("offer") && $mediaDtls->role == DtlsRole::Client) {
+            $dtlsTransport->setRole(DtlsRole::Server);
+        }
+        if ($sessionDescription->isType("answer")) {
+            $dtlsTransport->setRole($mediaDtls->role == DtlsRole::Client ? DtlsRole::Server : DtlsRole::Client);
+        }
+
+        $iceCandidates[spl_object_id($iceTransport)] = [$iceTransport, $media];
+    }
+
+    /**
+     * Handles BUNDLE group negotiation by consolidating transports.
+     *
+     * This implements the BUNDLE mechanism from RFC 8843, where multiple media streams
+     * share a single transport. It:
+     * - Identifies the primary transport from the BUNDLE group
+     * - Reconfigures secondary transports to use the primary transport
+     * - Cleans up old unused transports
+     *
+     * @param GroupDescription $bundleGroupDescription The BUNDLE group from SDP
+     * @param array<int, array{RTCIceTransportInterface, MediaDescription}> $iceCandidates Reference to array storing ICE candidates
+     * @param-out array<int, array{RTCIceTransportInterface, MediaDescription}> $iceCandidates
+     */
+    private function removeBundleTransport(GroupDescription $bundleGroupDescription, array &$iceCandidates): void
+    {
+        // find the main media stream
+        $masterMid = $bundleGroupDescription->items[0];
+        $masterTransport = null;
+        foreach ($this->transceivers as $transceiver) {
+            if ($transceiver->getMid() == $masterMid) {
+                $masterTransport = $this->requireDtlsTransport($transceiver->getDtlsTransport());
+                break;
+            }
+        }
+
+        if ($this->sctp && $this->sctp->getMid() == $masterMid) {
+            $masterTransport = $this->requireDtlsTransport($this->sctp->getDtlsTransport());
+        }
+
+        // A remote peer may negotiate a mid it renamed itself (browsers replace the generated
+        // mid with one of their own), so the BUNDLE group's master mid can point at a string
+        // no transceiver carries anymore. The master transport is still the transport of the
+        // first media section, so fall back to it when the literal mid does not match.
+        if ($masterTransport === null) {
+            foreach ($this->transceivers as $transceiver) {
+                if ($transceiver->getMid() !== null) {
+                    $masterTransport = $this->requireDtlsTransport($transceiver->getDtlsTransport());
+                    break;
+                }
+            }
+        }
+
+        if ($masterTransport === null) {
+            throw new RuntimeException("Unable to determine the master transport for the BUNDLE group");
+        }
+
+        // replace transport for bundled media
+        $oldTransports = [];
+        $slaveMids = array_slice($bundleGroupDescription->items, 1);
+        foreach ($this->transceivers as $transceiver) {
+            if (in_array($transceiver->getMid(), $slaveMids) && !$transceiver->isBundled()) {
+                $oldTransports[] = $this->requireDtlsTransport($transceiver->getDtlsTransport());
+                $transceiver->getReceiver()->setTransport($masterTransport);
+                $transceiver->getSender()->setTransport($masterTransport);
+                $transceiver->setBundled(true);
+                $transceiver->setDtlsTransport($masterTransport);
+            }
+        }
+
+        if ($this->sctp && in_array($this->sctp->getMid(), $slaveMids) && !$this->sctp->isBundled()) {
+            $oldTransports[] = $this->requireDtlsTransport($this->sctp->getDtlsTransport());
+            $this->sctp->setTransport($masterTransport);
+            $this->sctp->setBundled(true);
+        }
+
+        // stop and discard old ICE transports
+        foreach ($oldTransports as $dtlsTransport) {
+            $dtlsTransport->stop();
+            $iceTransport = $this->requireIceTransport($dtlsTransport->getIceTransport());
+            $iceTransport->stop();
+            unset($this->dtlsTransports[spl_object_id($dtlsTransport)]);
+            unset($this->iceTransports[spl_object_id($iceTransport)]);
+            unset($iceCandidates[spl_object_id($iceTransport)]);
+        }
+        $this->updateIceGatheringState();
+        $this->updateIceConnectionState();
+        $this->updateConnectionState();
+    }
+
+    /**
+     * Runs {@see self::connect()} off the current fiber.
+     *
+     * The ICE and DTLS handshakes both block until they are done, so applying a description must
+     * not wait for them.
+     */
+    private function scheduleConnect(): void
+    {
+        if ($this->connecting) {
+            // connect() only ever starts transports that are still new, so a second concurrent run
+            // would race the first one over the same handshakes: re-run it afterwards instead.
+            $this->connectPending = true;
+            return;
+        }
+        $this->connecting = true;
+        EventLoop::queue($this->runScheduledConnect(...));
+    }
+
+    /**
+     * Drive ICE/DTLS connect off the current fiber.
+     *
+     * Queued only as the first-class callable `$this->runScheduledConnect(...)` handed to
+     * EventLoop::queue(), including when unserialize re-queues it. That callable captures this
+     * method's private scope, so the event loop can run it while it stays private.
+     */
+    private function runScheduledConnect(): void
+    {
+            try {
+                do {
+                    $this->connectPending = false;
+                    $this->connect();
+                } while ($this->shouldConnectAgain() && !$this->isClosed);
+            } catch (Throwable $e) {
+                $this->logger?->error("RTCPeerConnection(" . spl_object_id($this) . "): could not connect: $e");
+            } finally {
+                $this->connecting = false;
+            }
+            $this->updateIceConnectionState();
+            $this->updateConnectionState();
+    }
+
+    /**
+     * True if a description was applied while connect() was running.
+     *
+     * connect() blocks through the ICE and DTLS handshakes, during which another
+     * fiber may apply a description (scheduling another connect()). Psalm cannot
+     * model this cross-fiber re-entrancy, so the flag is read through a method.
+     */
+    private function shouldConnectAgain(): bool
+    {
+        return $this->connectPending;
+    }
+
+    /**
+     * Connects all transports when ready.
+     *
+     * @throws RandomException If random number generation fails
+     * @throws TLSException If TLS handshake fails
+     * @throws DTLSException If DTLS handshake fails
+     * @throws OpenSSLException|Throwable If SSL operation fails
+     */
+    private function connect(): void
+    {
+        foreach ($this->transceivers as $transceiver) {
+            $dtlsTransport = $this->requireDtlsTransport($transceiver->getDtlsTransport());
+            $iceTransport = $this->requireIceTransport($dtlsTransport->getIceTransport());
+
+            if (!empty($iceTransport->getIceGatherer()->getLocalCandidates()) && isset($this->remoteIceParameters[spl_object_id($transceiver)])) {
+                if ($iceTransport->getState() === IceTransportState::new) {
+                    $remoteIce = $this->remoteIceParameters[spl_object_id($transceiver)];
+                    if ($remoteIce === null) {
+                        throw new RuntimeException("Remote ICE parameters are not available");
+                    }
+                    $iceTransport->start($remoteIce);
+                }
+
+                if ($dtlsTransport->getState() == TLSState::NEW && $iceTransport->getState() == IceTransportState::complete) {
+                    $remoteDtls = $this->remoteDtlsParameter[spl_object_id($transceiver)];
+                    if ($remoteDtls === null) {
+                        throw new RuntimeException("Remote DTLS parameters are not available");
+                    }
+                    $dtlsTransport->start($remoteDtls->fingerprints);
+                }
+
+                if ($dtlsTransport->getState() == TLSState::CONNECTED) {
+                    if (in_array($transceiver->getCurrentDirection(), [SDPDirections::sendonly, SDPDirections::sendrecv])) {
+                        $transceiver->getSender()->start($this->localRtp($transceiver));
+                    }
+                    if (in_array($transceiver->getCurrentDirection(), [SDPDirections::recvonly, SDPDirections::sendrecv])) {
+                        $transceiver->getReceiver()->start($this->remoteRtp($transceiver));
+                    }
+                }
+            }
+        }
+
+        if ($this->sctp && $this->sctpInband) {
+            // The media transport is driven by the transceiver loop above; the association only
+            // has to be started on it. A server registers itself before the DTLS handshake is done
+            // (see the comment below for why), a client once the transport carries application data.
+            $dtlsTransport = $this->requireDtlsTransport($this->sctp->getDtlsTransport());
+            if (!$this->isClosed && $this->sctpRemotePort !== null
+                && ($this->sctp->isServer() || $dtlsTransport->getState() == TLSState::CONNECTED)
+            ) {
+                $this->sctp->start($this->sctpRemotePort);
+            }
+        } elseif ($this->sctp) {
+            $dtlsTransport = $this->requireDtlsTransport($this->sctp->getDtlsTransport());
+            $iceTransport = $this->requireIceTransport($dtlsTransport->getIceTransport());
+            if ($iceTransport->getIceGatherer()->getLocalCandidates() && isset($this->remoteIceParameters[spl_object_id($this->sctp)])) {
+                if ($iceTransport->getState() === IceTransportState::new) {
+                    $remoteIce = $this->remoteIceParameters[spl_object_id($this->sctp)];
+                    if ($remoteIce === null) {
+                        throw new RuntimeException("Remote ICE parameters are not available");
+                    }
+                    $iceTransport->start($remoteIce);
+                }
+
+                // The client sends its first SCTP INIT the instant its DTLS handshake
+                // completes, which can land before ours does. Register the server-side
+                // receiver up front — before dtlsTransport->start() blocks through the
+                // handshake — so the receiver is provably in place before either side can
+                // finish handshaking (and thus before any INIT can arrive), instead of
+                // betting a fixed delay covers the skew. start() is idempotent, so the
+                // CONNECTED branch below is a no-op on this side.
+                if ($this->sctp->isServer() && !$this->isClosed && $this->sctpRemotePort !== null) {
+                    $this->sctp->start($this->sctpRemotePort);
+                }
+
+                if ($dtlsTransport->getState() == TLSState::NEW && $iceTransport->getState() == IceTransportState::complete) {
+                    $remoteDtls = $this->remoteDtlsParameter[spl_object_id($this->sctp)];
+                    if ($remoteDtls === null) {
+                        throw new RuntimeException("Remote DTLS parameters are not available");
+                    }
+                    $dtlsTransport->start($remoteDtls->fingerprints);
+                }
+
+                if ($dtlsTransport->getState() == TLSState::CONNECTED) {
+                    // Client side: emit the INIT now that DTLS carries application data.
+                    // Server side: already started above, so this is a no-op.
+                    if (!$this->isClosed && $this->sctpRemotePort !== null) {
+                        $this->sctp->start($this->sctpRemotePort);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Gathers ICE candidates for all transports.
+     *
+     * @throws RandomException If random number generation fails
+     * @throws Throwable If gathering fails
+     */
+    private function gatherIceCandidates(): void
+    {
+        foreach ($this->iceTransports as $iceTransport) {
+            $iceGatherer = $iceTransport->getIceGatherer();
+            if (!$iceGatherer instanceof RTCIceGatherer) {
+                throw new RuntimeException("Unsupported ICE gatherer implementation");
+            }
+            $iceGatherer->gather();
+        }
+    }
+
+    /**
+     * Verifies the connection is not closed.
+     *
+     * @throws RuntimeException If connection is closed
+     */
+    private function checkNotClosed(): void
+    {
+        if ($this->isClosed) {
+            throw new RuntimeException("RTCPeerConnection is closed");
+        }
+    }
+
+    /**
+     * Verifies a track doesn't already have a sender.
+     *
+     * @param MediaStreamTrack $track The track to check
+     * @throws InvalidArgumentException If track already has a sender
+     */
+    private function checkTrackHasNoSender(MediaStreamTrack $track): void
+    {
+        $senders = $this->getSenders();
+        foreach ($senders as $sender) {
+            if ($sender->getTrack() === $track) {
+                throw new InvalidArgumentException("Track already has a sender");
+            }
+        }
+    }
+
+    /**
+     * Creates RTP parameters for local sending.
+     *
+     * @param RTCRtpTransceiver $transceiver The sending transceiver
+     * @return RTCRtpSendParameters The send parameters
+     */
+    private function localRtp(RTCRtpTransceiver $transceiver): RTCRtpSendParameters
+    {
+        /** @var list<RTCRtpHeaderExtensionParameters> $headerExtensions */
+        $headerExtensions = $transceiver->getHeaderExtensions();
+        $rtp = new RTCRtpSendParameters($transceiver->getCodecs(), $headerExtensions, $transceiver->getMid() ?? '');
+        $rtp->rtcp->cname = $this->cname;
+        $rtp->rtcp->ssrc = $transceiver->getSender()->getSsrc();
+
+        $payloadType = null;
+        foreach ($transceiver->getCodecs() as $codec) {
+            if ($codec->payloadType !== null) {
+                $payloadType = $codec->payloadType;
+                break;
+            }
+        }
+        assert($payloadType !== null);
+        $rtp->encodings = [new RTCRtpEncodingParameters($transceiver->getSender()->getSsrc(), $payloadType)];
+
+        return $rtp;
+    }
+
+    /**
+     * Creates RTP parameters for remote receiving.
+     *
+     * @param RTCRtpTransceiver $transceiver The receiving transceiver
+     * @return RTCRtpReceiveParameters The receive parameters
+     */
+    private function remoteRtp(RTCRtpTransceiver $transceiver): RTCRtpReceiveParameters
+    {
+        $remoteDescription = $this->pendingRemoteDescription ?? $this->currentRemoteDescription;
+        if ($remoteDescription === null) {
+            throw new RuntimeException("Remote description is not available");
+        }
+        $mlineIndex = $transceiver->getMlineIndex();
+        if ($mlineIndex === null) {
+            throw new RuntimeException("Transceiver has no media line index");
+        }
+        $remoteMedia = $remoteDescription->getMedia()[$mlineIndex] ?? null;
+        if ($remoteMedia === null) {
+            throw new RuntimeException("No remote media section at media line {$mlineIndex}");
+        }
+        /** @var list<RTCRtpHeaderExtensionParameters> $headerExtensions */
+        $headerExtensions = $transceiver->getHeaderExtensions();
+        $rtp = new RTCRtpReceiveParameters($transceiver->getCodecs(), $headerExtensions, $remoteMedia->getRtp()->muxId, $remoteMedia->getRtp()->rtcp);
+
+        if (count($remoteMedia->getSsrc()) > 0) {
+            $encoding = [];
+            $rtx = [];
+            foreach ($transceiver->getCodecs() as $codec) {
+                if (CodecUtility::isRtx($codec)) {
+                    // A retransmission stream is not an encoding of its own: it is the second SSRC
+                    // of the FID group, and belongs to the encoding of the codec it repeats. The
+                    // lookup is by payload type, which is how the encodings are keyed.
+                    $apt = CodecUtility::apt($codec);
+                    if ($apt !== null && count($remoteMedia->getSsrc()) === 2) {
+                        $rtx[$apt] = new RTCRtpRtxParameters($remoteMedia->getSsrc()[1]->ssrc);
+                    }
+                    continue;
+                }
+            }
+            foreach ($transceiver->getCodecs() as $codec) {
+                if (!CodecUtility::isRtx($codec) && $codec->payloadType !== null) {
+                    $encoding[$codec->payloadType] = new RTCRtpDecodingParameters(
+                        $remoteMedia->getSsrc()[0]->ssrc,
+                        $codec->payloadType,
+                        $rtx[$codec->payloadType] ?? null,
+                    );
+                }
+            }
+            $rtp->encodings = $encoding;
+        }
+
+        return $rtp;
+    }
+
+    /**
+     * Updates the connection state based on transport states.
+     *
+     * @internal Public only because RTCPeerConnection registers itself as a typed state-change
+     * listener on the child ICE and DTLS transports (other packages' objects), which invoke this
+     * from outside this class. Being plain object wiring rather than a Closure, it survives
+     * serialization so the wiring is restored automatically. Not part of the public API.
+     */
+    public function updateConnectionState(): void
+    {
+        $dtlsStates = [];
+        foreach ($this->dtlsTransports as $transport) {
+            $dtlsStates[$transport->getState()->value] = true;
+        }
+
+        $iceStates = [];
+        foreach ($this->iceTransports as $transport) {
+            $iceStates[$transport->getState()->value] = true;
+        }
+
+        // Compute new state
+        if ($this->isClosed) {
+            $state = ConnectionState::closed;
+        } elseif (isset($iceStates[IceTransportState::failed->value]) || isset($dtlsStates[TLSState::FAILED->value])) {
+            $state = ConnectionState::failed;
+        } elseif (isset($iceStates[IceTransportState::new->value]) && isset($dtlsStates[TLSState::NEW->value])) {
+            $state = ConnectionState::new;
+        } elseif (isset($iceStates[IceTransportState::checking->value]) || isset($dtlsStates[TLSState::CONNECTING->value]) || isset($dtlsStates[TLSState::NEW->value])) {
+            $state = ConnectionState::connecting;
+        } else {
+            $state = ConnectionState::connected;
+        }
+
+        // Update state
+        if ($state !== $this->connectionState) {
+            $this->debug(sprintf("connectionState %s -> %s", $this->connectionState->name, $state->name));
+            $this->connectionState = $state;
+            $this->notifyConnectionStateChange();
+        }
+
+        if (!$this->isClosed && isset($dtlsStates[TLSState::CLOSED->value])) {
+            $this->close();
+        }
+    }
+
+    /**
+     * Updates the ICE connection state based on transport states.
+     *
+     * @internal Public only because RTCPeerConnection registers itself as a typed state-change
+     * listener on the child ICE transport (another package's object), which invokes this from
+     * outside this class. Being plain object wiring rather than a Closure, it survives
+     * serialization so the wiring is restored automatically. Not part of the public API.
+     */
+    public function updateIceConnectionState(): void
+    {
+        $iceStates = array_values(array_map(fn(RTCIceTransport $transport) => $transport->getState(), $this->iceTransports));
+
+        if ($this->isClosed || $iceStates === [IceTransportState::closed]) {
+            $state = IceConnectionState::closed;
+        } elseif (in_array(IceTransportState::failed, $iceStates)) {
+            $state = IceConnectionState::failed;
+        } elseif ($iceStates === [IceTransportState::complete]) {
+            $state = IceConnectionState::completed;
+        } elseif (in_array(IceTransportState::checking, $iceStates)) {
+            $state = IceConnectionState::checking;
+        } else {
+            $state = IceConnectionState::new;
+        }
+        // var_dump($state);
+
+        // update $state
+        if ($state !== $this->iceConnectionState) {
+            $this->debug(sprintf("iceConnectionState %s -> %s", $this->iceConnectionState->name, $state->name));
+            $this->iceConnectionState = $state;
+            $this->notifyIceConnectionStateChange();
+        }
+    }
+
+    /**
+     * Updates the ICE gathering state based on the state of all ICE transports.
+     *
+     * Notifies "icegatheringstatechange" listeners if the state changes.
+     *
+     * @internal Public only because RTCPeerConnection registers itself as a typed state-change
+     * listener on each child ICE gatherer (another package's object), which invokes this from
+     * outside this class. Being plain object wiring rather than a Closure, it survives
+     * serialization so the wiring is restored automatically. Not part of the public API.
+     */
+    public function updateIceGatheringState(): void
+    {
+        // Compute new state
+        $states = [];
+        foreach ($this->iceTransports as $transport) {
+            $states[] = $transport->getIceGatherer()->getState()->name;
+        }
+
+        $uniqueStates = array_unique($states);
+
+        if ($uniqueStates === [IceGatheringState::complete->name]) {
+            $state = IceGatheringState::complete;
+        } elseif (in_array(IceGatheringState::gathering->name, $uniqueStates, true)) {
+            $state = IceGatheringState::gathering;
+        } else {
+            $state = IceGatheringState::new;
+        }
+
+        // Update state
+        if ($state !== $this->iceGatheringState) {
+            $this->logger?->debug(sprintf("iceGatheringState %s -> %s", $this->iceGatheringState->name, $state->name));
+            $this->iceGatheringState = $state;
+            $this->notifyIceGatheringStateChange();
+        }
+    }
+
+    /**
+     * Finds preferred codecs from available options.
+     *
+     * @param RTCRtpCodecParameters[] $codecs Available codecs
+     * @param RTCRtpCodecCapability[] $preferredCodecs Preferred codecs
+     * @return RTCRtpCodecParameters[] Filtered codecs
+     */
+    public function findPreferredCodecs(array $codecs, array $preferredCodecs): array
+    {
+        if (empty($preferredCodecs)) {
+            return $codecs;
+        }
+
+        $rtxCodecs = array_filter($codecs, fn(RTCRtpCodecParameters $codec) => CodecUtility::isRtx($codec));
+        $rtxPreferredCodecs = array_filter($preferredCodecs, fn(RTCRtpCodecCapability $codec) => !CodecUtility::isRtx($codec));
+        $rtxEnabled = array_any($preferredCodecs, fn(RTCRtpCodecCapability $codec) => CodecUtility::isRtx($codec));
+
+        $filtered = [];
+        foreach ($rtxPreferredCodecs as $pref) {
+            foreach ($codecs as $codec) {
+                if (strtolower($codec->mimeType) === strtolower($pref->mimeType) && $codec->parameters === $pref->parameters) {
+                    $filtered[] = $codec;
+
+                    // add corresponding RTX
+                    if ($rtxEnabled) {
+                        foreach ($rtxCodecs as $rtx) {
+                            if (CodecUtility::apt($rtx) === $codec->payloadType) {
+                                $filtered[] = $rtx;
+                                break;
+                            }
+                        }
+                    }
+
+                    break;
+                }
+            }
+        }
+
+        return $filtered;
+    }
+
+    /**
+     * Finds mutually supported codecs between local and remote offers.
+     *
+     * This performs codec negotiation by:
+     * - Matching codec types and parameters
+     * - Handling RTX (retransmission) codecs specially
+     * - Preserving dynamic payload types from the remote offer
+     * - Filtering RTCP feedback capabilities based on mutual support
+     *
+     * @param array<RTCRtpCodecParameters> $localCodecs Local codec capabilities
+     * @param array<RTCRtpCodecParameters> $remoteCodecs Remote codec offers
+     * @return array<RTCRtpCodecParameters> Mutually supported codecs with negotiated parameters
+     */
+    public function findMutualCodecs(array $localCodecs, array $remoteCodecs): array
+    {
+        $mutual = [];
+        $mutualBase = [];
+
+        foreach ($remoteCodecs as $remoteCodec) {
+            // for RTX, check we accepted the base codec
+            if ((strtolower(explode("/", $remoteCodec->mimeType)[1]) === "rtx")) {
+                $apt = $remoteCodec->parameters['apt'] ?? null;
+                if ($apt !== null && isset($mutualBase[$apt])) {
+                    $base = $mutualBase[$apt];
+                    if ($remoteCodec->clockRate === $base->clockRate) {
+                        $mutual[] = clone $remoteCodec;
+                    }
+                }
+                continue;
+            }
+
+            // handle other codecs
+            foreach ($localCodecs as $localCodec) {
+                if ($this->isCodecCompatible($localCodec, $remoteCodec)) {
+                    $codec = clone $localCodec;
+                    if (in_array($remoteCodec->payloadType, RtpConstants::DYNAMIC_PAYLOAD_TYPES)) {
+                        $codec->payloadType = $remoteCodec->payloadType;
+                    }
+                    $codec->rtcpFeedback = array_filter($codec->rtcpFeedback, fn(RTCRtcpFeedback $codec) => in_array($codec, $remoteCodec->rtcpFeedback));
+                    $mutual[] = $codec;
+                    if ($codec->payloadType !== null) {
+                        $mutualBase[$codec->payloadType] = $codec;
+                    }
+                    break;
+                }
+            }
+        }
+
+        return $mutual;
+    }
+
+    /**
+     * Adds remote ICE candidates to transport.
+     *
+     * @param RTCIceTransport $iceTransport The transport to add to
+     * @param MediaDescription $media The media description containing candidates
+     */
+    private function addRemoteCandidates(RTCIceTransport $iceTransport, MediaDescription $media): void
+    {
+        foreach ($media->getIceCandidates() as $candidate) {
+            $iceTransport->addRemoteCandidate($candidate);
+        }
+
+        if ($media->isIceCandidatesComplete()) {
+            $iceTransport->endRemoteCandidate();
+        }
+    }
+
+    /**
+     * Reverses a direction (sendonly <-> recvonly).
+     *
+     * @param SDPDirections $direction The direction to reverse
+     * @return SDPDirections The reversed direction
+     * @throws InvalidArgumentException If a direction can’t be reversed
+     */
+    private function reverseDirection(SDPDirections $direction): SDPDirections
+    {
+        return match ($direction) {
+            SDPDirections::sendonly => SDPDirections::recvonly,
+            SDPDirections::recvonly => SDPDirections::sendonly,
+            default => $direction
+        };
+    }
+
+    /**
+     * Finds mutually supported header extensions.
+     *
+     * @param RTCRtpHeaderExtensionParameters[] $localExtensions Local extensions
+     * @param RTCRtpHeaderExtensionParameters[] $remoteExtensions Remote extensions
+     * @return RTCRtpHeaderExtensionParameters[] Mutual extensions
+     */
+    private function findMutualHeaderExtensions(array $localExtensions, array $remoteExtensions): array
+    {
+        $mutual = [];
+
+        foreach ($remoteExtensions as $rExt) {
+            foreach ($localExtensions as $lExt) {
+                if ($lExt->uri === $rExt->uri) {
+                    $mutual[] = $rExt;
+                }
+            }
+        }
+
+        return $mutual;
+    }
+
+    /**
+     * Validates a session description.
+     *
+     * @param SessionDescription $description The description to validate
+     * @param bool $isLocal Whether the description is local
+     * @throws InvalidArgumentException If description is invalid
+     */
+    private function validateDescription(SessionDescription $description, bool $isLocal): void
+    {
+        // Check description is compatible with signaling state
+        if ($isLocal) {
+            if ($description->isType("offer")) {
+                if (!in_array($this->signalingState, [SignalingState::stable, SignalingState::haveLocalOffer])) {
+                    throw new InvalidArgumentException(
+                        "Cannot handle offer in signaling state \"" . $this->signalingState->name . "\""
+                    );
+                }
+            } elseif ($description->isType("answer")) {
+                if (!in_array($this->signalingState, [SignalingState::haveRemoteOffer, SignalingState::haveLocalPranswer])) {
+                    throw new InvalidArgumentException(
+                        "Cannot handle answer in signaling state \"" . $this->signalingState->name . "\""
+                    );
+                }
+            }
+        } else {
+            if ($description->isType("offer")) {
+                if (!in_array($this->signalingState, [SignalingState::stable, SignalingState::haveRemoteOffer])) {
+                    throw new InvalidArgumentException(
+                        "Cannot handle offer in signaling state \"" . $this->signalingState->name . "\""
+                    );
+                }
+            } elseif ($description->isType("answer")) {
+                if (!in_array($this->signalingState, [SignalingState::haveLocalOffer, SignalingState::haveLocalPranswer])) {
+                    throw new InvalidArgumentException(
+                        "Cannot handle answer in signaling state \"" . $this->signalingState->name . "\""
+                    );
+                }
+            }
+        }
+
+        foreach ($description->getMedia() as $media) {
+            // RFC 3264 rejects a media stream by setting its port to zero. A rejected section is
+            // retained only to preserve m-line ordering and does not establish a transport.
+            if ($media->getPort() === 0) {
+                continue;
+            }
+            // Check ICE credentials were provided
+            $ice = $media->getIce();
+            if ($ice === null || $ice->usernameFragment === null || $ice->password === null) {
+                throw new InvalidArgumentException("ICE username fragment or password is missing");
+            }
+
+            // Check a DTLS role is allowed
+            if (in_array($description->getType(), ["answer", "pranswer"]) &&
+                !in_array($media->getDtls()?->role, [DtlsRole::Client, DtlsRole::Server])) {
+                throw new InvalidArgumentException(
+                    "DTLS setup attribute must be 'active' or 'passive' for an answer"
+                );
+            }
+
+            // Check RTCP mux is used
+            if (in_array($media->getKind(), ["audio", "video"]) && !$media->isRtcpMux()) {
+                throw new InvalidArgumentException("RTCP mux is not enabled");
+            }
+        }
+
+        // Check the number of media section matches
+        if (in_array($description->getType(), ["answer", "pranswer"])) {
+            $offer = $isLocal ? $this->getRemoteDescription() : $this->getLocalDescription();
+            if ($offer === null) {
+                throw new InvalidArgumentException("Cannot validate answer: no matching offer description is set");
+            }
+
+            $offerMedia = array_map(fn(MediaDescription $media) => [$media->getKind(), $media->getRtp()->muxId], SessionDescription::decode($offer->getSdp())->getMedia());
+            $answerMedia = array_map(fn($media) => [$media->getKind(), $media->getRtp()->muxId], $description->getMedia());
+
+            if ($answerMedia != $offerMedia) {
+                throw new InvalidArgumentException("Media sections in answer do not match offer");
+            }
+        }
+    }
+
+    /**
+     * Checks if two codecs are compatible.
+     *
+     * @param RTCRtpCodecParameters $a First codec
+     * @param RTCRtpCodecParameters $b Second codec
+     * @return bool True if compatible
+     */
+    public function isCodecCompatible(RTCRtpCodecParameters $a, RTCRtpCodecParameters $b): bool
+    {
+        if (strtolower($a->mimeType) !== strtolower($b->mimeType) || $a->clockRate !== $b->clockRate) {
+            return false;
+        }
+
+        if (strtolower($a->mimeType) === "video/h264") {
+            try {
+                return $this->packetization($a) === $this->packetization($b) && $this->profile($a) === $this->profile($b);
+            } catch (Throwable $e) {
+                // A malformed profile-level-id in the remote codec params makes the pair
+                // incompatible, but log it: otherwise H.264 is silently dropped from negotiation
+                // and surfaces only as an unexplained "no video".
+                $this->logger?->warning("Ignoring H.264 codec with unparseable parameters during codec matching: " . $e->getMessage());
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Gets the H.264 profile from codec parameters.
+     *
+     * @param RTCRtpCodecParameters $codec The codec parameters
+     * @return H264Profile The H.264 profile
+     */
+    private function profile(RTCRtpCodecParameters $codec): H264Profile
+    {
+        return H264Sdp::parseH264ProfileLevelId((string)($codec->parameters['profile-level-id'] ?? '42E01F'))[0];
+    }
+
+    /**
+     * Gets the packetization mode from codec parameters.
+     *
+     * @param RTCRtpCodecParameters $codec The codec parameters
+     * @return string The packetization mode
+     */
+    private function packetization(RTCRtpCodecParameters $codec): string
+    {
+        if (array_key_exists('packetization-mode', $codec->parameters)) {
+            $mode = $codec->parameters['packetization-mode'];
+            if ($mode !== null) {
+                return (string)$mode;
+            }
+        }
+        return '0';
+    }
+
+    /**
+     * Resolves the concrete DTLS transport for a transceiver or SCTP transport.
+     *
+     * @param RTCRTPDtlsTransportInterface|RTCSctpDtlsTransportInterface|null $transport The transport to resolve
+     * @throws RuntimeException If no usable DTLS transport is available
+     */
+    private function requireDtlsTransport(RTCRTPDtlsTransportInterface|RTCSctpDtlsTransportInterface|null $transport): RTCDtlsTransport
+    {
+        if (!$transport instanceof RTCDtlsTransport) {
+            throw new RuntimeException("DTLS transport is not available");
+        }
+        return $transport;
+    }
+
+    /**
+     * Resolves the concrete ICE transport for a DTLS transport.
+     *
+     * @param RTCIceTransportInterface $transport The transport to resolve
+     * @throws RuntimeException If no usable ICE transport is available
+     */
+    private function requireIceTransport(RTCIceTransportInterface $transport): RTCIceTransport
+    {
+        if (!$transport instanceof RTCIceTransport) {
+            throw new RuntimeException("ICE transport is not available");
+        }
+        return $transport;
+    }
+
+    /**
+     * Logs a debug message.
+     *
+     * @param string $log The message to log
+     */
+    private function debug(string $log): void
+    {
+        $this->logger?->debug("RTCPeerConnection(" . spl_object_id($this) . "): " . $log);
+    }
+
+    /**
+     * Sets whether to use legacy SDP format for SCTP.
+     *
+     * @param bool $sctpLegacySdp Whether to use a legacy format
+     */
+    public function setSctpLegacySdp(bool $sctpLegacySdp): void
+    {
+        $this->sctpLegacySdp = $sctpLegacySdp;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function __serialize(): array
+    {
+        $state = SerializableState::export($this, [
+            // WeakMaps cannot be serialized; snapshot their keys and rebuild on the far side.
+            'trackListeners' => ['__uninitialized' => true],
+            'peerConnectionDataChannelListeners' => ['__uninitialized' => true],
+            'signalingStateChangeListeners' => ['__uninitialized' => true],
+            'connectionStateChangeListeners' => ['__uninitialized' => true],
+            'iceConnectionStateChangeListeners' => ['__uninitialized' => true],
+            'iceGatheringStateChangeListeners' => ['__uninitialized' => true],
+        ]);
+        $state['__trackListeners'] = SerializableState::weakMapToList($this->trackListeners);
+        $state['__peerConnectionDataChannelListeners'] = SerializableState::weakMapToList($this->peerConnectionDataChannelListeners);
+        $state['__signalingStateChangeListeners'] = SerializableState::weakMapToList($this->signalingStateChangeListeners);
+        $state['__connectionStateChangeListeners'] = SerializableState::weakMapToList($this->connectionStateChangeListeners);
+        $state['__iceConnectionStateChangeListeners'] = SerializableState::weakMapToList($this->iceConnectionStateChangeListeners);
+        $state['__iceGatheringStateChangeListeners'] = SerializableState::weakMapToList($this->iceGatheringStateChangeListeners);
+
+        return $state;
+    }
+
+    /**
+     * @param array<string, mixed> $data
+     */
+    public function __unserialize(array $data): void
+    {
+        /** @var list<PeerConnectionTrackListener> $trackListeners */
+        $trackListeners = $data['__trackListeners'] ?? [];
+        /** @var list<PeerConnectionDataChannelListener> $peerConnectionDataChannelListeners */
+        $peerConnectionDataChannelListeners = $data['__peerConnectionDataChannelListeners'] ?? [];
+        /** @var list<PeerConnectionSignalingStateChangeListener> $signalingStateChangeListeners */
+        $signalingStateChangeListeners = $data['__signalingStateChangeListeners'] ?? [];
+        /** @var list<PeerConnectionConnectionStateChangeListener> $connectionStateChangeListeners */
+        $connectionStateChangeListeners = $data['__connectionStateChangeListeners'] ?? [];
+        /** @var list<PeerConnectionIceConnectionStateChangeListener> $iceConnectionStateChangeListeners */
+        $iceConnectionStateChangeListeners = $data['__iceConnectionStateChangeListeners'] ?? [];
+        /** @var list<PeerConnectionIceGatheringStateChangeListener> $iceGatheringStateChangeListeners */
+        $iceGatheringStateChangeListeners = $data['__iceGatheringStateChangeListeners'] ?? [];
+        unset(
+            $data['__trackListeners'],
+            $data['__peerConnectionDataChannelListeners'],
+            $data['__signalingStateChangeListeners'],
+            $data['__connectionStateChangeListeners'],
+            $data['__iceConnectionStateChangeListeners'],
+            $data['__iceGatheringStateChangeListeners'],
+        );
+
+        SerializableState::import($this, $data);
+        /** @var \WeakMap<PeerConnectionTrackListener, null> */
+        $this->trackListeners = SerializableState::listToWeakMap($trackListeners);
+        /** @var \WeakMap<PeerConnectionDataChannelListener, null> */
+        $this->peerConnectionDataChannelListeners = SerializableState::listToWeakMap($peerConnectionDataChannelListeners);
+        /** @var \WeakMap<PeerConnectionSignalingStateChangeListener, null> */
+        $this->signalingStateChangeListeners = SerializableState::listToWeakMap($signalingStateChangeListeners);
+        /** @var \WeakMap<PeerConnectionConnectionStateChangeListener, null> */
+        $this->connectionStateChangeListeners = SerializableState::listToWeakMap($connectionStateChangeListeners);
+        /** @var \WeakMap<PeerConnectionIceConnectionStateChangeListener, null> */
+        $this->iceConnectionStateChangeListeners = SerializableState::listToWeakMap($iceConnectionStateChangeListeners);
+        /** @var \WeakMap<PeerConnectionIceGatheringStateChangeListener, null> */
+        $this->iceGatheringStateChangeListeners = SerializableState::listToWeakMap($iceGatheringStateChangeListeners);
+
+        if ($this->connecting) {
+            $this->connecting = false;
+            $this->scheduleConnect();
+        }
+    }
+}

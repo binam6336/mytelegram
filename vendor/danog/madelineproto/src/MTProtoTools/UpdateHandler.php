@@ -1,0 +1,1813 @@
+<?php
+
+declare(strict_types=1);
+
+/**
+ * UpdateHandler module.
+ *
+ * This file is part of MadelineProto.
+ * MadelineProto is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+ * MadelineProto is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU Affero General Public License for more details.
+ * You should have received a copy of the GNU General Public License along with MadelineProto.
+ * If not, see <http://www.gnu.org/licenses/>.
+ *
+ * @author    Daniil Gentili <daniil@daniil.it>
+ * @copyright 2016-2025 Daniil Gentili <daniil@daniil.it>
+ * @license   https://opensource.org/licenses/AGPL-3.0 AGPLv3
+ * @link https://docs.madelineproto.xyz MadelineProto documentation
+ */
+
+namespace danog\MadelineProto\MTProtoTools;
+
+use Amp\ByteStream\ReadableStream;
+use Amp\Cancellation;
+use Amp\CancelledException;
+use Amp\CompositeCancellation;
+use Amp\DeferredCancellation;
+use Amp\DeferredFuture;
+use Amp\Future;
+use Amp\Http\Client\Request;
+use Amp\Http\Client\Response;
+use Amp\TimeoutException;
+use AssertionError;
+use danog\AsyncOrm\Annotations\OrmMappedArray;
+use danog\AsyncOrm\DbArray;
+use danog\AsyncOrm\KeyType;
+use danog\AsyncOrm\ValueType;
+use danog\BetterPrometheus\BetterCounter;
+use danog\DialogId\DialogId;
+use danog\MadelineProto\API;
+use danog\MadelineProto\BotApiFileId;
+use danog\MadelineProto\EventHandler\AbstractMessage;
+use danog\MadelineProto\EventHandler\BotCommands;
+use danog\MadelineProto\EventHandler\Calls\AbstractGroupCall;
+use danog\MadelineProto\EventHandler\Calls\CallStreams;
+use danog\MadelineProto\EventHandler\Calls\ConferenceCall as ConferenceCallUpdate;
+use danog\MadelineProto\EventHandler\Calls\GroupCall as GroupCallUpdate;
+use danog\MadelineProto\EventHandler\Calls\GroupCallMessagesDeleted;
+use danog\MadelineProto\EventHandler\Calls\GroupCallParticipants;
+use danog\MadelineProto\EventHandler\Calls\LiveStory;
+use danog\MadelineProto\EventHandler\Calls\MultiCallMessage;
+use danog\MadelineProto\EventHandler\Channel\ChannelParticipant;
+use danog\MadelineProto\EventHandler\Channel\MessageForwards;
+use danog\MadelineProto\EventHandler\Channel\MessageViewsChanged;
+use danog\MadelineProto\EventHandler\Channel\UpdateChannel;
+use danog\MadelineProto\EventHandler\ChatInviteRequester\BotChatInviteRequest;
+use danog\MadelineProto\EventHandler\ChatInviteRequester\PendingJoinRequests;
+use danog\MadelineProto\EventHandler\Delete\DeleteChannelMessages;
+use danog\MadelineProto\EventHandler\Delete\DeleteMessages;
+use danog\MadelineProto\EventHandler\Delete\DeleteScheduledMessages;
+use danog\MadelineProto\EventHandler\InlineQuery;
+use danog\MadelineProto\EventHandler\Message;
+use danog\MadelineProto\EventHandler\Message\ChannelMessage;
+use danog\MadelineProto\EventHandler\Message\CommentReply;
+use danog\MadelineProto\EventHandler\Message\Entities\MessageEntity;
+use danog\MadelineProto\EventHandler\Message\Entities\TextWithEntities;
+use danog\MadelineProto\EventHandler\Message\GroupMessage;
+use danog\MadelineProto\EventHandler\Message\PrivateMessage;
+use danog\MadelineProto\EventHandler\Message\RichMessage;
+use danog\MadelineProto\EventHandler\Message\SecretMessage;
+use danog\MadelineProto\EventHandler\Message\Service\DialogBotAllowed;
+use danog\MadelineProto\EventHandler\Message\Service\DialogChannelCreated;
+use danog\MadelineProto\EventHandler\Message\Service\DialogChannelMigrateFrom;
+use danog\MadelineProto\EventHandler\Message\Service\DialogChatJoinedByLink;
+use danog\MadelineProto\EventHandler\Message\Service\DialogChatMigrateTo;
+use danog\MadelineProto\EventHandler\Message\Service\DialogConferenceCall;
+use danog\MadelineProto\EventHandler\Message\Service\DialogContactSignUp;
+use danog\MadelineProto\EventHandler\Message\Service\DialogCreated;
+use danog\MadelineProto\EventHandler\Message\Service\DialogDeleteMessages;
+use danog\MadelineProto\EventHandler\Message\Service\DialogGameScore;
+use danog\MadelineProto\EventHandler\Message\Service\DialogGeoProximityReached;
+use danog\MadelineProto\EventHandler\Message\Service\DialogGiftPremium;
+use danog\MadelineProto\EventHandler\Message\Service\DialogGiftStars;
+use danog\MadelineProto\EventHandler\Message\Service\DialogGroupCall\GroupCall;
+use danog\MadelineProto\EventHandler\Message\Service\DialogGroupCall\GroupCallInvited;
+use danog\MadelineProto\EventHandler\Message\Service\DialogGroupCall\GroupCallScheduled;
+use danog\MadelineProto\EventHandler\Message\Service\DialogHistoryCleared;
+use danog\MadelineProto\EventHandler\Message\Service\DialogMemberJoinedByRequest;
+use danog\MadelineProto\EventHandler\Message\Service\DialogMemberLeft;
+use danog\MadelineProto\EventHandler\Message\Service\DialogMembersJoined;
+use danog\MadelineProto\EventHandler\Message\Service\DialogMessagePinned;
+use danog\MadelineProto\EventHandler\Message\Service\DialogNoForwardRequest;
+use danog\MadelineProto\EventHandler\Message\Service\DialogNoForwardToggle;
+use danog\MadelineProto\EventHandler\Message\Service\DialogPaymentSent;
+use danog\MadelineProto\EventHandler\Message\Service\DialogPaymentSentMe;
+use danog\MadelineProto\EventHandler\Message\Service\DialogPeerRequested;
+use danog\MadelineProto\EventHandler\Message\Service\DialogPhoneCall;
+use danog\MadelineProto\EventHandler\Message\Service\DialogPhotoChanged;
+use danog\MadelineProto\EventHandler\Message\Service\DialogReadMessages;
+use danog\MadelineProto\EventHandler\Message\Service\DialogScreenshotTaken;
+use danog\MadelineProto\EventHandler\Message\Service\DialogSetChatTheme;
+use danog\MadelineProto\EventHandler\Message\Service\DialogSetChatWallPaper;
+use danog\MadelineProto\EventHandler\Message\Service\DialogSetTTL;
+use danog\MadelineProto\EventHandler\Message\Service\DialogStarGift;
+use danog\MadelineProto\EventHandler\Message\Service\DialogSuggestProfilePhoto;
+use danog\MadelineProto\EventHandler\Message\Service\DialogTitleChanged;
+use danog\MadelineProto\EventHandler\Message\Service\DialogTopicCreated;
+use danog\MadelineProto\EventHandler\Message\Service\DialogTopicEdited;
+use danog\MadelineProto\EventHandler\Message\Service\DialogWebView;
+use danog\MadelineProto\EventHandler\Payments\Payment;
+use danog\MadelineProto\EventHandler\Payments\PaymentCharge;
+use danog\MadelineProto\EventHandler\Payments\PaymentRequestedInfo;
+use danog\MadelineProto\EventHandler\Payments\StarGift;
+use danog\MadelineProto\EventHandler\Pinned;
+use danog\MadelineProto\EventHandler\Pinned\PinnedChannelMessages;
+use danog\MadelineProto\EventHandler\Pinned\PinnedGroupMessages;
+use danog\MadelineProto\EventHandler\Pinned\PinnedPrivateMessages;
+use danog\MadelineProto\EventHandler\Privacy;
+use danog\MadelineProto\EventHandler\Query\ChatButtonQuery;
+use danog\MadelineProto\EventHandler\Query\ChatGameQuery;
+use danog\MadelineProto\EventHandler\Query\InlineButtonQuery;
+use danog\MadelineProto\EventHandler\Query\InlineGameQuery;
+use danog\MadelineProto\EventHandler\Story\Story;
+use danog\MadelineProto\EventHandler\Story\StoryDeleted;
+use danog\MadelineProto\EventHandler\Story\StoryReaction;
+use danog\MadelineProto\EventHandler\Typing\ChatUserTyping;
+use danog\MadelineProto\EventHandler\Typing\SecretUserTyping;
+use danog\MadelineProto\EventHandler\Typing\SupergroupUserTyping;
+use danog\MadelineProto\EventHandler\Typing\UserTyping;
+use danog\MadelineProto\EventHandler\Update;
+use danog\MadelineProto\EventHandler\User\Blocked;
+use danog\MadelineProto\EventHandler\User\BotStopped;
+use danog\MadelineProto\EventHandler\User\Phone;
+use danog\MadelineProto\EventHandler\User\Status;
+use danog\MadelineProto\EventHandler\User\Status\Emoji;
+use danog\MadelineProto\EventHandler\User\Username;
+use danog\MadelineProto\EventHandler\Wallpaper;
+use danog\MadelineProto\Exception;
+use danog\MadelineProto\Lang;
+use danog\MadelineProto\LocalFile;
+use danog\MadelineProto\Logger;
+use danog\MadelineProto\Loop\Update\FeedLoop;
+use danog\MadelineProto\Loop\Update\UpdateLoop;
+use danog\MadelineProto\MTProto\SpecialMethodType;
+use danog\MadelineProto\ParseMode;
+use danog\MadelineProto\PeerNotInDbException;
+use danog\MadelineProto\RemoteUrl;
+use danog\MadelineProto\ResponseException;
+use danog\MadelineProto\RichParseMode;
+use danog\MadelineProto\RPCError\ChannelPrivateError;
+use danog\MadelineProto\RPCError\FloodWaitError;
+use danog\MadelineProto\RPCError\MsgIdInvalidError;
+use danog\MadelineProto\RPCError\SessionPasswordNeededError;
+use danog\MadelineProto\RPCErrorException;
+use danog\MadelineProto\Settings;
+use danog\MadelineProto\Tgcalls\PrivateCallController;
+use danog\MadelineProto\TL\Conversion\Rich\InputConverter;
+use danog\MadelineProto\TL\TL;
+use danog\MadelineProto\Tools;
+use danog\MadelineProto\UpdateHandlerType;
+use danog\MadelineProto\VoIP\DiscardReason;
+use Revolt\EventLoop;
+use SplQueue;
+use Throwable;
+use Webmozart\Assert\Assert;
+use function Amp\delay;
+
+/**
+ * Manages updates.
+ *
+ * @property Settings $settings Settings
+ * @property TL       $TL       TL
+ *
+ * @internal
+ */
+trait UpdateHandler
+{
+    private UpdateHandlerType $updateHandlerType = UpdateHandlerType::NOOP;
+
+    private bool $got_state = false;
+    /** @deprecated */
+    private CombinedUpdatesState $channels_state;
+    private CombinedUpdatesState $updateState;
+    /** @var DbArray<int, array> */
+    #[OrmMappedArray(KeyType::INT, ValueType::SCALAR)]
+    private $getUpdatesQueue;
+    private int $getUpdatesQueueKey = 0;
+    private SplQueue $updateQueue;
+    /** Whether the updates postponed while the event handler is starting will be handled once it started. */
+    private bool $updateQueueReplay = false;
+
+    /**
+     * Set NOOP update handler, ignoring all updates.
+     */
+    public function setNoop(): void
+    {
+        $this->updateHandlerType = UpdateHandlerType::NOOP;
+        $this->getUpdatesQueue->clear();
+        $this->getUpdatesQueueKey = 0;
+        $q = new SplQueue;
+        $q->setIteratorMode(SplQueue::IT_MODE_DELETE);
+        $this->updateQueue = $q;
+        $this->event_handler = null;
+        $this->event_handler_instance = null;
+        $this->eventHandlerMethods = [];
+        $this->eventHandlerHandlers = [];
+        $this->pluginInstances = [];
+    }
+    /**
+     * PWRTelegram webhook URL.
+     */
+    private ?string $webhookUrl = null;
+    /**
+     * Set webhook update handler.
+     *
+     * @param string $webhookUrl Webhook URL
+     */
+    public function setWebhook(string $webhookUrl): void
+    {
+        $this->webhookUrl = $webhookUrl;
+        $this->updateHandlerType = UpdateHandlerType::WEBHOOK;
+        foreach ($this->getUpdatesQueue as $update) {
+            $this->handleUpdate($update);
+        }
+        $this->getUpdatesQueue->clear();
+        $this->getUpdatesQueueKey = 0;
+        foreach ($this->updateQueue as $update) {
+            $this->handleUpdate($update);
+        }
+        $this->event_handler = null;
+        $this->event_handler_instance = null;
+        $this->eventHandlerMethods = [];
+        $this->eventHandlerHandlers = [];
+        $this->pluginInstances = [];
+    }
+
+    /**
+     * Event update handler.
+     *
+     * @param array $update Update
+     */
+    private function eventUpdateHandler(array $update): void
+    {
+        $updateType = $update['_'];
+        if ($f = $this->event_handler_instance->waitForInternalStart()) {
+            $this->logger->logger("Postponing update handling, onStart is still running (if stuck here for too long, make sure to fork long-running tasks in onStart using \$this->callFork(function () { ... }) to fix this)...", Logger::NOTICE);
+            $this->updateQueue->enqueue($update);
+            $this->handlePostponedUpdates($f);
+            return;
+        }
+        if (\count($this->eventHandlerHandlers) !== 0 && \is_array($update)) {
+            $obj = $this->wrapUpdate($update);
+            if ($obj !== null) {
+                foreach ($this->eventHandlerHandlers as $closure) {
+                    EventLoop::queue($this->rethrowHandler, $closure, $obj);
+                }
+            }
+        }
+        if ($updateType === 'updateBroadcastProgress') {
+            $update = $update['progress'];
+        }
+        if (isset($this->eventHandlerMethods[$updateType])) {
+            foreach ($this->eventHandlerMethods[$updateType] as $closure) {
+                EventLoop::queue($this->rethrowHandler, $closure, $update);
+            }
+        }
+    }
+
+    private function rethrowUpdateHandler(\Closure $closure, mixed $update): void
+    {
+        try {
+            $closure($update);
+        } catch (\Throwable $e) {
+            $this->rethrowInner($e);
+        }
+    }
+
+    /**
+     * Send update to webhook.
+     *
+     * @param array $update Update
+     */
+    private function pwrWebhook(array $update): void
+    {
+        $payload = json_encode($update);
+        Assert::notEmpty($payload);
+        Assert::notNull($this->webhookUrl);
+        $request = new Request($this->webhookUrl, 'POST');
+        $request->setHeader('content-type', 'application/json');
+        $request->setBody($payload);
+        try {
+            /** @var Response */
+            $result = $this->datacenter->getHTTPClient()->request($request);
+            $status = $result->getStatus();
+            if ($status !== 200) {
+                throw new Exception("Got bad status $status!");
+            }
+        } catch (Throwable $e) {
+            $this->logger->logger("Got {$e->getMessage()} while sending webhook", Logger::FATAL_ERROR);
+            $this->updateQueue->enqueue($update);
+            delay(1.0);
+            foreach ($this->updateQueue as $update) {
+                $this->handleUpdate($update);
+            }
+        }
+    }
+
+    private ?DeferredFuture $update_deferred = null;
+    /**
+     * Signal update.
+     *
+     * @internal
+     */
+    private function addGetUpdatesUpdate($update): void
+    {
+        $this->getUpdatesQueue[$this->getUpdatesQueueKey++] = $update;
+        if ($this->update_deferred) {
+            $deferred = $this->update_deferred;
+            $this->update_deferred = null;
+            $deferred->complete();
+        }
+    }
+
+    private bool $usingGetUpdates = false;
+    private static ?TimeoutException $getUpdatesTimeout = null;
+    /**
+     * Only useful when consuming MadelineProto updates through an API in another language (like Javascript), **absolutely not recommended when directly writing MadelineProto bots**.
+     *
+     * `getUpdates` will **greatly slow down your bot** if used directly inside of PHP code.
+     *
+     * **Only use the [event handler](#async-event-driven) when writing a MadelineProto bot**, because update handling in the **event handler** is completely parallelized and non-blocking.
+     *
+     * @param  array{offset?: int, limit?: int, timeout?: float} $params       Params: once the timeout expires, an empty array is returned
+     * @param  ?Cancellation                                     $cancellation Cancellation: once cancelled, the wait stops with a CancelledException
+     * @return list<array{update_id: mixed, update: mixed}>
+     */
+    public function getUpdates(array $params = [], ?Cancellation $cancellation = null): array
+    {
+        if ($this->usingGetUpdates) {
+            throw new AssertionError("Concurrent getUpdates detected, aborting!");
+        }
+        $id = null;
+        try {
+            $this->usingGetUpdates = true;
+            if ($this->updateHandlerType !== UpdateHandlerType::GET_UPDATES) {
+                $this->updateHandlerType = UpdateHandlerType::GET_UPDATES;
+                $this->event_handler = null;
+                $this->event_handler_instance = null;
+                $this->eventHandlerMethods = [];
+                $this->eventHandlerHandlers = [];
+                $this->pluginInstances = [];
+            }
+            foreach ($this->updateQueue as $update) {
+                $this->addGetUpdatesUpdate($update);
+            }
+
+            [
+                'offset' => $offset,
+                'limit' => $limit,
+                'timeout' => $timeout
+            ] = array_merge(['offset' => 0, 'limit' => null, 'timeout' => 10.0], $params);
+
+            if ($offset < 0) {
+                $offset = $this->getUpdatesQueueKey+$offset;
+            }
+
+            Assert::nullOrPositiveInteger($limit);
+
+            if ($timeout === INF) {
+                $timeout = null;
+            } elseif ($timeout !== null) {
+                self::$getUpdatesTimeout ??= new TimeoutException("Operation timed out");
+                $deferred = new DeferredCancellation;
+                $id = EventLoop::delay($timeout, static fn () => $deferred->cancel(self::$getUpdatesTimeout));
+                $timeout = $deferred->getCancellation();
+            }
+            $wait = $timeout !== null && $cancellation !== null
+                ? new CompositeCancellation($timeout, $cancellation)
+                : $timeout ?? $cancellation;
+
+            do {
+                if (!$this->getUpdatesQueue->count()) {
+                    try {
+                        $this->update_deferred = new DeferredFuture();
+                        $this->update_deferred->getFuture()->await($wait);
+                    } catch (CancelledException $e) {
+                        // Only our own timeout returns what was received so far: a cancellation of the caller
+                        // (even one by a TimeoutCancellation of its own) is thrown.
+                        if ($cancellation?->isRequested() || !$timeout?->isRequested()) {
+                            throw $e;
+                        }
+                    }
+                }
+                $updates = [];
+                foreach ($this->getUpdatesQueue as $key => $value) {
+                    if ($offset > $key) {
+                        unset($this->getUpdatesQueue[$key]);
+                        continue;
+                    }
+
+                    $updates[$key] = ['update_id' => $key, 'update' => $value];
+
+                    if ($limit !== null && \count($updates) === $limit) {
+                        break;
+                    }
+                }
+                if ($updates) {
+                    ksort($updates);
+                    return array_values($updates);
+                }
+            } while (!$timeout?->isRequested());
+            return [];
+        } finally {
+            $this->usingGetUpdates = false;
+            if ($id !== null && !$timeout->isRequested()) {
+                EventLoop::cancel($id);
+            }
+        }
+    }
+    /**
+     * Check message ID.
+     *
+     * @param array $message Message
+     *
+     * @internal
+     *
+     * @psalm-external-mutation-free
+     */
+    public function checkMsgId(array $message): bool
+    {
+        if (!isset($message['peer_id'])) {
+            return true;
+        }
+        $peer_id = $message['peer_id'];
+        $message_id = $message['id'];
+        if (!isset($this->msg_ids[$peer_id]) || $message_id > $this->msg_ids[$peer_id]) {
+            $this->msg_ids[$peer_id] = $message_id;
+            return true;
+        }
+        return false;
+    }
+    /**
+     * Get channel state.
+     *
+     * @internal
+     */
+    public function loadUpdateState()
+    {
+        if (!$this->got_state) {
+            $this->updateState->get(0, $this->getUpdatesState());
+            $this->got_state = true;
+        }
+        return $this->updateState->get(0);
+    }
+    /**
+     * Load channel state.
+     *
+     * @param null|int $channelId Channel ID
+     * @param array    $init      Init
+     *
+     * @internal
+     *
+     * @return UpdatesState|array<UpdatesState>
+     *
+     * @psalm-external-mutation-free
+     */
+    public function loadChannelState(?int $channelId = null, array $init = []): UpdatesState|array
+    {
+        return $this->updateState->get($channelId, $init);
+    }
+    /**
+     * Get channel states.
+     *
+     * @internal
+     */
+    public function getChannelStates(): CombinedUpdatesState
+    {
+        return $this->updateState;
+    }
+    /**
+     * Get update state.
+     *
+     * @internal
+     */
+    private function getUpdatesState()
+    {
+        $data = $this->methodCallAsyncRead('updates.getState', []);
+        $this->getCdnConfig();
+        return $data;
+    }
+    /**
+     * Wrap an Update constructor into an abstract Update object.
+     */
+    public function wrapUpdate(array $update): ?Update
+    {
+        try {
+            return match ($update['_']) {
+                'updateNewChannelMessage', 'updateNewMessage', 'updateNewScheduledMessage', 'updateEditMessage', 'updateEditChannelMessage','updateNewEncryptedMessage','updateNewOutgoingEncryptedMessage' => $this->wrapMessage($update['message'], $update['_'] === 'updateNewScheduledMessage'),
+                'updatePinnedMessages', 'updatePinnedChannelMessages' => $this->wrapPin($update),
+                'updateBotCallbackQuery' => isset($update['game_short_name'])
+                    ? new ChatGameQuery($this, $update)
+                    : new ChatButtonQuery($this, $update),
+                'updateInlineBotCallbackQuery' => isset($update['game_short_name'])
+                    ? new InlineGameQuery($this, $update)
+                    : new InlineButtonQuery($this, $update),
+                'updateBotInlineQuery' => new InlineQuery($this, $update),
+                'updatePhoneCall' => $update['phone_call'],
+                'updateGroupCall' => $this->wrapGroupCall($update),
+                'updateGroupCallParticipants' => new GroupCallParticipants($this, $update),
+                'updateGroupCallMessage' => MultiCallMessage::fromUpdate($this, $update),
+                'updateDeleteGroupCallMessages' => new GroupCallMessagesDeleted($this, $update),
+                'updateCallStreams' => new CallStreams($this, $update),
+                'updateBroadcastProgress' => $update['progress'],
+                'updateStory' => $update['story']['_'] === 'storyItemDeleted'
+                    ? new StoryDeleted($this, $update)
+                    : new Story($this, $update),
+                'updateSentStoryReaction'       => new StoryReaction($this, $update),
+                'updateUserStatus'              => Status::fromRawStatus($this, $update),
+                'updatePeerBlocked'             => new Blocked($this, $update),
+                'updateBotStopped'              => new BotStopped($this, $update),
+                'updateUserEmojiStatus'         => new Emoji($this, $update),
+                'updateUserName'                => new Username($this, $update),
+                'updateUserPhone'               => new Phone($this, $update),
+                'updatePrivacy'                 => new Privacy($this, $update),
+                'updateUserTyping'              => new UserTyping($this, $update),
+                'updateChannelUserTyping'       => new SupergroupUserTyping($this, $update),
+                'updateChatUserTyping'          => new ChatUserTyping($this, $update),
+                'updateChannel'                 => new UpdateChannel($this, $update),
+                'updateChannelMessageViews'     => new MessageViewsChanged($this, $update),
+                'updateChannelMessageForwards'  => new MessageForwards($this, $update),
+                'updateChannelParticipant'      => new ChannelParticipant($this, $update),
+                'updateDeleteMessages'          => new DeleteMessages($this, $update),
+                'updateDeleteChannelMessages'   => new DeleteChannelMessages($this, $update),
+                'updateDeleteScheduledMessages' => new DeleteScheduledMessages($this, $update),
+                'updatePendingJoinRequests'     => new PendingJoinRequests($this, $update),
+                'updateBotChatInviteRequester'  => new BotChatInviteRequest($this, $update),
+                'updateBotCommands'             => new BotCommands($this, $update),
+                'updateBotPrecheckoutQuery'     => new Payment($this, $update),
+                default => null
+            };
+        } catch (\Throwable $e) {
+            $update = json_encode($update);
+            $this->logger->logger("An error occured while wrapping $update: $e", Logger::FATAL_ERROR);
+            $this->report("An error occured while wrapping $update: $e");
+            return null;
+        }
+    }
+    /**
+     * The handle of the call an updateGroupCall is about: the one we track, or else a fresh one built
+     * from the groupCall the update carries (a conference handle for a conference).
+     */
+    private function wrapGroupCall(array $update): AbstractGroupCall|ConferenceCallUpdate
+    {
+        $call = $update['call'];
+        $id = $call['id'];
+        if (isset($this->conferenceCalls[$id])) {
+            return $this->conferenceCalls[$id]->getPublic();
+        }
+        if (isset($this->groupCalls[$id])) {
+            return $this->groupCalls[$id]->public;
+        }
+        if ($call['conference'] ?? false) {
+            return new ConferenceCallUpdate($this, $call);
+        }
+        $peerId = isset($update['peer']) ? $this->getIdInternal($update['peer']) : null;
+        return ($update['live_story'] ?? false)
+            ? new LiveStory($this, $call, $peerId)
+            : new GroupCallUpdate($this, $call, $peerId);
+    }
+
+    /**
+     * Wrap a Pin constructor into an abstract Pinned object.
+     */
+    public function wrapPin(array $message): ?Pinned
+    {
+        return match ($this->getInfo($message)['type']) {
+            API::PEER_TYPE_BOT, API::PEER_TYPE_USER => new PinnedPrivateMessages($this, $message),
+            API::PEER_TYPE_GROUP, API::PEER_TYPE_SUPERGROUP => new PinnedGroupMessages($this, $message),
+            API::PEER_TYPE_CHANNEL => new PinnedChannelMessages($this, $message),
+            default => null,
+        };
+    }
+    /**
+     * Wrap a Message constructor into an abstract Message object.
+     */
+    public function wrapMessage(array $message, bool $scheduled = false): ?AbstractMessage
+    {
+        if ($message['_'] === 'messageEmpty') {
+            return null;
+        }
+        $info = $this->getInfo($message);
+        if ($message['_'] === 'messageService') {
+            return match ($message['action']['_']) {
+                'messageActionBotAllowed' => new DialogBotAllowed(
+                    $this,
+                    $message,
+                    $info,
+                ),
+                'messageActionHistoryClear' => new DialogHistoryCleared(
+                    $this,
+                    $message,
+                    $info,
+                ),
+                'messageActionContactSignUp' => new DialogContactSignUp(
+                    $this,
+                    $message,
+                    $info,
+                ),
+                'messageActionChatJoinedByRequest' => new DialogMemberJoinedByRequest(
+                    $this,
+                    $message,
+                    $info,
+                ),
+                'messageActionChatAddUser' => new DialogMembersJoined(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['users']
+                ),
+                'messageActionChatDeleteUser' => new DialogMemberLeft(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['user_id']
+                ),
+
+                'messageActionChatJoinedByLink' => new DialogChatJoinedByLink(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['inviter_id'],
+                ),
+                'messageActionChatCreate' => new DialogCreated(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['title'],
+                    $message['action']['users'],
+                ),
+                'messageActionChatEditTitle' => new DialogTitleChanged(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['title']
+                ),
+                'messageActionChatEditPhoto' => new DialogPhotoChanged(
+                    $this,
+                    $message,
+                    $info,
+                    $this->wrapMedia($message['action']['photo'])
+                ),
+                'messageActionChatDeletePhoto' => new DialogPhotoChanged(
+                    $this,
+                    $message,
+                    $info,
+                    null
+                ),
+                'messageActionPinMessage' => new DialogMessagePinned(
+                    $this,
+                    $message,
+                    $info,
+                ),
+                'messageActionScreenshotTaken' => new DialogScreenshotTaken(
+                    $this,
+                    $message,
+                    $info,
+                ),
+                'messageActionChannelCreate' => new DialogChannelCreated(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['title'],
+                ),
+                'messageActionChatMigrateTo' => new DialogChatMigrateTo(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['channel_id'],
+                ),
+                'messageActionChannelMigrateFrom' => new DialogChannelMigrateFrom(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['title'],
+                    $message['action']['chat_id'],
+                ),
+                'messageActionGameScore' => new DialogGameScore(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['game_id'],
+                    $message['action']['score'],
+                ),
+                'messageActionGeoProximityReached' => new DialogGeoProximityReached(
+                    $this,
+                    $message,
+                    $info,
+                    $this->getIdInternal($message['action']['from_id']),
+                    $this->getIdInternal($message['action']['to_id']),
+                    $message['action']['distance'],
+                ),
+                'messageActionPhoneCall' => new DialogPhoneCall(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['video'],
+                    $message['action']['call_id'],
+                    DiscardReason::tryfrom($message['action']['reason']['_'] ?? ''),
+                    $message['action']['duration'] ?? null,
+                ),
+                'messageActionGroupCall' => new GroupCall(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['duration'] ?? null,
+                ),
+                'messageActionConferenceCall' => new DialogConferenceCall(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['call_id'],
+                    $message['action']['missed'] ?? false,
+                    $message['action']['active'] ?? false,
+                    $message['action']['video'] ?? false,
+                    $message['action']['duration'] ?? null,
+                    array_values(array_filter(array_map($this->getIdInternal(...), $message['action']['other_participants'] ?? []))),
+                ),
+                'messageActionInviteToGroupCall' => new GroupCallInvited(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['users'],
+                ),
+                'messageActionGroupCallScheduled' => new GroupCallScheduled(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['schedule_date'],
+                ),
+                'messageActionSetMessagesTTL' => new DialogSetTTL(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['period'],
+                    $message['action']['auto_setting_from'] ?? null,
+                ),
+                'messageActionSetChatTheme' => new DialogSetChatTheme(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['theme'],
+                ),
+                'messageActionWebViewDataSentMe' => new DialogWebView(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['text'],
+                    $message['action']['data'],
+                ),
+                'messageActionWebViewDataSent' => new DialogWebView(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['text'],
+                    null
+                ),
+                'messageActionGiftStars' => new DialogGiftStars(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['currency'],
+                    $message['action']['amount'],
+                    $message['action']['stars'],
+                    $message['action']['crypto_currency'] ?? null,
+                    $message['action']['crypto_amount'] ?? null,
+                    $message['action']['transaction_id'],
+                ),
+                'messageActionStarGift' => new DialogStarGift(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['name_hidden'] ?? null,
+                    $message['action']['saved'] ?? null,
+                    $message['action']['converted'] ?? null,
+                    new StarGift(
+                        $this,
+                        $message['action']['gift']
+                    ),
+                    isset($message['action']['message']) ? new TextWithEntities(
+                        $message['action']['message']['text'],
+                        MessageEntity::fromRawEntities($message['action']['message']['entities']),
+                        isset($message['action']['message']['parse_mode']) ?
+                            ParseMode::from($message['action']['message']['parse_mode'])
+                            : null
+                    ) : null,
+                    $message['action']['convert_stars'],
+                ),
+                'messageActionPaymentSent' => new DialogPaymentSent(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['recurring_init'] ?? null,
+                    $message['action']['recurring_used'] ?? null,
+                    $message['action']['currency'],
+                    $message['action']['total_amount'],
+                    $message['action']['invoice_slug'] ?? null,
+                    $message['action']['subscription_until_date'] ?? null
+                ),
+                'messageActionPaymentSentMe' => new DialogPaymentSentMe(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['recurring_init'] ?? null,
+                    $message['action']['recurring_used'] ?? null,
+                    $message['action']['currency'],
+                    $message['action']['total_amount'],
+                    $message['action']['payload'],
+                    isset($message['action']['info'])
+                        ? PaymentRequestedInfo::fromRawInfo($message['action']['info'])
+                        : null,
+                    $message['action']['shipping_option_id'] ?? null,
+                    new PaymentCharge(
+                        $message['action']['charge']['id'],
+                        $message['action']['charge']['provider_charge_id']
+                    ),
+                    $message['action']['subscription_until_date'] ?? null
+                ),
+                'messageActionGiftPremium' => new DialogGiftPremium(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['currency'],
+                    $message['action']['amount'],
+                    $message['action']['months'],
+                    $message['action']['crypto_currency'] ?? null,
+                    $message['action']['crypto_amount'] ?? null,
+                ),
+                'messageActionTopicCreate' => new DialogTopicCreated(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['title'],
+                    $message['action']['icon_color'],
+                    $message['action']['icon_emoji_id'] ?? null,
+                ),
+                'messageActionTopicEdit' => new DialogTopicEdited(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['title'] ?? null,
+                    $message['action']['icon_emoji_id'] ?? null,
+                    $message['action']['closed'] ?? null,
+                    $message['action']['hidden'] ?? null,
+                ),
+                'messageActionSuggestProfilePhoto' => new DialogSuggestProfilePhoto(
+                    $this,
+                    $message,
+                    $info,
+                    $this->wrapMedia($message['action']['photo'])
+                ),
+                'messageActionRequestedPeerSentMe' => new DialogPeerRequested(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['button_id'],
+                    $message['action']['peers'],
+                ),
+                'messageActionSetChatWallPaper' => new DialogSetChatWallPaper(
+                    $this,
+                    $message,
+                    $info,
+                    new Wallpaper($this, $message['action']['wallpaper']),
+                    $message['action']['same'] ?? false,
+                    $message['action']['for_both'] ?? false,
+                ),
+                'messageActionNoForwardsRequest' => new DialogNoForwardRequest(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['expired'],
+                    $message['action']['prev_value'],
+                    $message['action']['new_value'],
+                ),
+                'messageActionNoForwardsToggle' => new DialogNoForwardToggle(
+                    $this,
+                    $message,
+                    $info,
+                    $message['action']['prev_value'],
+                    $message['action']['new_value'],
+                ),
+                default => null
+            };
+        }
+        if ($message['_'] === 'encryptedMessageService') {
+            $action = $message['decrypted_message']['action'];
+            return match ($action['_']) {
+                'decryptedMessageActionSetMessageTTL' => new DialogSetTTL(
+                    $this,
+                    $message,
+                    $info,
+                    $action['ttl_seconds'],
+                    null,
+                ),
+                'decryptedMessageActionReadMessages' => new DialogReadMessages(
+                    $this,
+                    $message,
+                    $info,
+                    $action['random_ids'],
+                ),
+                'decryptedMessageActionDeleteMessages' => new DialogDeleteMessages(
+                    $this,
+                    $message,
+                    $info,
+                    $action['random_ids'],
+                ),
+                'decryptedMessageActionScreenshotMessages' => new DialogScreenshotTaken(
+                    $this,
+                    $message,
+                    $info,
+                    $action['random_ids'],
+                ),
+                'decryptedMessageActionFlushHistory' => new DialogHistoryCleared(
+                    $this,
+                    $message,
+                    $info,
+                ),
+                'decryptedMessageActionTyping' => new SecretUserTyping(
+                    $this,
+                    $message,
+                    $info,
+                ),
+                default => null
+            };
+        }
+        if (($info['User']['username'] ?? '') === 'replies') {
+            return new CommentReply($this, $message, $info, $scheduled);
+        }
+        if ($message['_'] === 'encryptedMessage') {
+            return new SecretMessage($this, $message, $info, $scheduled);
+        }
+        return match ($info['type']) {
+            API::PEER_TYPE_BOT, API::PEER_TYPE_USER => new PrivateMessage($this, $message, $info, $scheduled),
+            API::PEER_TYPE_GROUP, API::PEER_TYPE_SUPERGROUP => new GroupMessage($this, $message, $info, $scheduled),
+            API::PEER_TYPE_CHANNEL => new ChannelMessage($this, $message, $info, $scheduled),
+        };
+    }
+    /**
+     * Sends a message.
+     *
+     * @param integer|string $peer                   Destination peer or username.
+     * @param string         $message                Message to send
+     * @param ParseMode      $parseMode              Parse mode
+     * @param integer|null   $replyToMsgId           ID of message to reply to.
+     * @param integer|null   $topMsgId               ID of thread where to send the message.
+     * @param array|null     $replyMarkup            Keyboard information.
+     * @param integer|null   $sendAs                 Peer to send the message as.
+     * @param integer|null   $scheduleDate           Schedule date.
+     * @param boolean        $silent                 Whether to send the message silently, without triggering notifications.
+     * @param boolean        $background             Send this message as background message
+     * @param boolean        $clearDraft             Clears the draft field
+     * @param boolean        $noWebpage              Set this flag to disable generation of the webpage preview
+     * @param boolean        $updateStickersetsOrder Whether to move used stickersets to top
+     * @param ?Cancellation  $cancellation           Cancellation
+     * @param integer|string|null $replyToPeer       Chat of the message to reply to, if not the destination chat (a cross-chat reply).
+     */
+    public function sendMessage(
+        int|string $peer,
+        string $message,
+        ParseMode $parseMode = ParseMode::TEXT,
+        ?int $replyToMsgId = null,
+        ?int $topMsgId = null,
+        ?array $replyMarkup = null,
+        int|string|null $sendAs = null,
+        ?int $scheduleDate = null,
+        bool $silent = false,
+        bool $noForwards = false,
+        bool $background = false,
+        bool $clearDraft = false,
+        bool $noWebpage = false,
+        bool $updateStickersetsOrder = false,
+        ?Cancellation $cancellation = null,
+        int|string|null $replyToPeer = null,
+    ): Message {
+        $result = $this->methodCallAsyncRead(
+            'messages.sendMessage',
+            [
+                'peer' => $peer,
+                'message' => $message,
+                'parse_mode' => $parseMode,
+                'reply_to' => $replyToMsgId !== null || $topMsgId !== null ? [
+                    '_' => 'inputReplyToMessage',
+                    'reply_to_msg_id' => $replyToMsgId,
+                    'top_msg_id' => $topMsgId,
+                    'reply_to_peer_id' => $replyToPeer,
+                ] : null,
+                'reply_markup' => $replyMarkup,
+                'send_as' => $sendAs,
+                'schedule_date' => $scheduleDate,
+                'silent' => $silent,
+                'noforwards' => $noForwards,
+                'background' => $background,
+                'clear_draft' => $clearDraft,
+                'no_webpage' => $noWebpage,
+                'update_stickersets_order' => $updateStickersetsOrder,
+                'cancellation' => $cancellation,
+            ]
+        );
+        if (isset($result['_'])) {
+            return $this->wrapMessage($this->extractMessage($result));
+        }
+
+        $last = null;
+        foreach ($result as $updates) {
+            /** @var Message */
+            $new = $this->wrapMessage($this->extractMessage($updates));
+            if ($last) {
+                $last->nextSent = $new;
+            } else {
+                $first = $new;
+            }
+            $last = $new;
+        }
+        return $first;
+    }
+    /**
+     * Sends a [rich message](https://core.telegram.org/bots/api#sendrichmessage): structured text made of blocks (headings, paragraphs, lists, tables, quotes, media, buttons and so on).
+     *
+     * The message can be passed as:
+     * - Plain text (the default, sent as a single paragraph), or Markdown or HTML (with $parseMode), parsed by Telegram; media passed in $media can be embedded by ID, e.g. `![A cat](tg://photo?id=cat)` or `![A file](tg://document?id=file)` in Markdown.
+     * - A list of blocks: typed Block objects (`new Paragraph(new Bold('Hello'))`, see the EventHandler\Message\Rich\Block namespace), arrays in the format of the Bot API's [InputRichBlock](https://core.telegram.org/bots/api#inputrichblock) type, or raw MTProto PageBlock constructors.
+     * - A received RichMessage (`$message->richMessage`), to send it again.
+     * - A full Bot API [InputRichMessage](https://core.telegram.org/bots/api#inputrichmessage), or a raw MTProto InputRichMessage constructor.
+     *
+     * $parseMode only applies to string messages, and $media only to Markdown and HTML: passing them with other messages throws.
+     *
+     * Media in Bot API blocks and in $media can be Message or Media objects, bot API file IDs, raw photos and documents, or files to upload (LocalFile, RemoteUrl, ReadableStream or URLs), optionally wrapped in a Bot API InputMedia-like array (`['type' => 'video', 'media' => new LocalFile('video.mp4'), 'duration' => 10]`). Files in $media are uploaded with the type of the tg://photo, tg://video, tg://audio or tg://document link that references them, unless the wrapper specifies a type.
+     *
+     * @param integer|string           $peer         Destination peer or username.
+     * @param string|array|RichMessage $message      Rich message to send
+     * @param RichParseMode            $parseMode    How to parse a string $message: plain text (the default) is sent as a single paragraph, Markdown and HTML are parsed by Telegram.
+     * @param integer|null             $replyToMsgId ID of message to reply to.
+     * @param integer|null             $topMsgId     ID of thread where to send the message.
+     * @param array|null               $replyMarkup  Keyboard information.
+     * @param integer|string|null      $sendAs       Peer to send the message as.
+     * @param integer|null             $scheduleDate Schedule date.
+     * @param boolean                  $silent       Whether to send the message silently, without triggering notifications.
+     * @param boolean                  $noForwards   Only for bots, disallows further re-forwarding and saving of the messages, even if the destination chat doesn’t have [content protection](https://telegram.org/blog/protected-content-delete-by-date-and-more) enabled
+     * @param boolean                  $background   Send this message as background message
+     * @param boolean                  $clearDraft   Clears the draft field
+     * @param array                    $media        Media referenced by Markdown or HTML messages, as a map from ID (1-64 characters among A-Z, a-z, 0-9, _ and -) to file (a Message, Media, LocalFile, RemoteUrl, BotApiFileId or ReadableStream), or a list of Bot API InputRichMessageMedia objects.
+     * @param boolean                  $rtl          Whether the text is right-to-left
+     * @param boolean                  $noAutolink   Whether to skip the automatic detection of mentions, hashtags, URLs and so on
+     * @param ?Cancellation            $cancellation Cancellation
+     */
+    public function sendRichMessage(
+        int|string $peer,
+        string|array|RichMessage $message,
+        RichParseMode $parseMode = RichParseMode::TEXT,
+        ?int $replyToMsgId = null,
+        ?int $topMsgId = null,
+        ?array $replyMarkup = null,
+        int|string|null $sendAs = null,
+        ?int $scheduleDate = null,
+        bool $silent = false,
+        bool $noForwards = false,
+        bool $background = false,
+        bool $clearDraft = false,
+        array $media = [],
+        bool $rtl = false,
+        bool $noAutolink = false,
+        ?Cancellation $cancellation = null
+    ): Message {
+        $result = $this->methodCallAsyncRead(
+            'messages.sendMessage',
+            [
+                'peer' => $peer,
+                'message' => '',
+                'rich_message' => InputConverter::fromParameters($message, $parseMode, $media, $rtl, $noAutolink),
+                'reply_to' => $replyToMsgId !== null || $topMsgId !== null ? [
+                    '_' => 'inputReplyToMessage',
+                    'reply_to_msg_id' => $replyToMsgId,
+                    'top_msg_id' => $topMsgId,
+                ] : null,
+                'reply_markup' => $replyMarkup,
+                'send_as' => $sendAs,
+                'schedule_date' => $scheduleDate,
+                'silent' => $silent,
+                'noforwards' => $noForwards,
+                'background' => $background,
+                'clear_draft' => $clearDraft,
+                'cancellation' => $cancellation,
+            ]
+        );
+        return $this->wrapMessage($this->extractMessage($result));
+    }
+    /**
+     * Streams a partial [rich message](https://core.telegram.org/bots/api#sendrichmessagedraft) to a private chat while it is being generated (e.g. by an AI), see sendRichMessage for the supported formats.
+     *
+     * Call it again with the returned draft ID to update the draft, then send the complete message with sendRichMessage.
+     *
+     * Media must have already been uploaded (e.g. with uploadPhoto, uploadVideo, uploadDocument and so on).
+     *
+     * @param integer|string           $peer         Destination peer or username.
+     * @param string|array|RichMessage $message      Partial rich message
+     * @param RichParseMode            $parseMode    How to parse a string $message: plain text (the default) is sent as a single paragraph, Markdown and HTML are parsed by Telegram.
+     * @param array                    $media        Media referenced by Markdown or HTML messages, as a map from ID to file (a Message, Media or BotApiFileId: new files can't be uploaded).
+     * @param ?integer                 $draftId      ID of the draft to update (non-zero), if null a new draft ID is generated.
+     * @param boolean                  $canStop      Whether the user can stop the generation of the message
+     * @param boolean                  $keepOnStop   Whether the draft should be kept if the user stops the generation
+     * @param boolean                  $rtl          Whether the text is right-to-left
+     * @param boolean                  $noAutolink   Whether to skip the automatic detection of mentions, hashtags, URLs and so on
+     * @param integer|null             $topMsgId     ID of thread where to send the draft.
+     * @param ?Cancellation            $cancellation Cancellation
+     *
+     * @return integer The draft ID, to pass to the next calls to update the draft.
+     */
+    public function sendRichMessageDraft(
+        int|string $peer,
+        string|array|RichMessage $message,
+        RichParseMode $parseMode = RichParseMode::TEXT,
+        array $media = [],
+        ?int $draftId = null,
+        bool $canStop = false,
+        bool $keepOnStop = false,
+        bool $rtl = false,
+        bool $noAutolink = false,
+        ?int $topMsgId = null,
+        ?Cancellation $cancellation = null,
+    ): int {
+        if ($draftId === 0) {
+            throw new Exception('The draft ID must be non-zero');
+        }
+        // Telegram requires a non-zero draft ID
+        while ($draftId === null || $draftId === 0) {
+            $draftId = Tools::randomInt();
+        }
+        $this->methodCallAsyncRead(
+            'messages.setTyping',
+            [
+                'peer' => $peer,
+                'top_msg_id' => $topMsgId,
+                'action' => [
+                    '_' => 'inputSendMessageRichMessageDraftAction',
+                    'can_stop' => $canStop,
+                    'keep_on_stop' => $keepOnStop,
+                    'random_id' => $draftId,
+                    'rich_message' => $this->toInputRichMessage(
+                        InputConverter::fromParameters($message, $parseMode, $media, $rtl, $noAutolink),
+                        $peer,
+                        allowUploads: false,
+                        cancellation: $cancellation,
+                    ),
+                ],
+                'cancellation' => $cancellation,
+            ]
+        );
+        return $draftId;
+    }
+    /**
+     * Convert a rich message in Bot API format (or a received RichMessage) to an MTProto InputRichMessage, uploading its media if needed.
+     *
+     * @internal
+     *
+     * @param array|RichMessage   $message      Bot API InputRichMessage, received RichMessage, or MTProto InputRichMessage (returned as-is)
+     * @param integer|string|null $peer         Peer the rich message will be sent to, used to upload media
+     * @param boolean             $allowUploads Whether new files can be uploaded
+     */
+    public function toInputRichMessage(array|RichMessage $message, int|string|null $peer = null, bool $allowUploads = true, ?Cancellation $cancellation = null): array
+    {
+        return InputConverter::convert($message, function (string $type, mixed $media) use ($peer, $allowUploads, $cancellation): array {
+            $extra = [];
+            if (\is_array($media) && !isset($media['_'])) {
+                $last = end($media);
+                if (!isset($media['media']) && !isset($media['file_id']) && \is_array($last) && isset($last['file_id'])) {
+                    // Bot API photo (list of PhotoSize), as in the output of MTProtoToBotAPI: its largest size
+                    $media = end($media)['file_id'];
+                } elseif (isset($media['file_id']) && !isset($media['media'])) {
+                    // Bot API Video, Animation, Audio, Voice or Document, as in the output of MTProtoToBotAPI
+                    $media = $media['file_id'];
+                } else {
+                    // Bot API InputMedia-like object
+                    $extra = $media;
+                    $media = $media['media'] ?? throw new Exception("The media of the $type must be specified");
+                }
+            }
+            if ($media === null) {
+                throw new Exception("The media of the $type must be specified");
+            }
+            if (\is_array($media) && \in_array($media['_'] ?? null, ['inputPhoto', 'inputDocument'], true)) {
+                return $media;
+            }
+            if (\is_string($media)) {
+                if (str_starts_with($media, 'attach://')) {
+                    throw new Exception("attach:// files aren't supported, pass a LocalFile, RemoteUrl or ReadableStream instead");
+                }
+                if (preg_match('~^https?://~i', $media)) {
+                    $media = new RemoteUrl($media);
+                }
+            }
+            if ($media instanceof LocalFile || $media instanceof RemoteUrl || $media instanceof ReadableStream) {
+                if (!$allowUploads) {
+                    throw new Exception("New files can't be uploaded with this method: upload them first with uploadPhoto, uploadVideo, uploadDocument and so on, and pass the returned Media objects");
+                }
+                $thumb = $extra['thumbnail'] ?? $extra['thumb'] ?? null;
+                if (\is_string($thumb) && preg_match('~^https?://~i', $thumb)) {
+                    $thumb = new RemoteUrl($thumb);
+                }
+                if (!($thumb instanceof LocalFile || $thumb instanceof RemoteUrl || $thumb instanceof ReadableStream)) {
+                    $thumb = null;
+                }
+                $duration = isset($extra['duration']) ? (int) $extra['duration'] : null;
+                $width = isset($extra['width']) ? (int) $extra['width'] : null;
+                $height = isset($extra['height']) ? (int) $extra['height'] : null;
+                // Streams have no file name of their own, and uploads need one
+                $fileName = isset($extra['file_name']) ? (string) $extra['file_name'] : ($media instanceof ReadableStream ? match ($type) {
+                    'photo', 'live_photo' => 'photo.jpg',
+                    'video' => 'video.mp4',
+                    'animation' => 'animation.mp4',
+                    'audio' => 'audio.mp3',
+                    'voice_note' => 'voice.ogg',
+                    default => 'file',
+                } : null);
+                $media = match ($type) {
+                    'photo', 'live_photo' => $this->uploadPhoto(file: $media, peer: $peer, fileName: $fileName, cancellation: $cancellation),
+                    'video' => $this->uploadVideo(
+                        file: $media,
+                        thumb: $thumb,
+                        peer: $peer,
+                        fileName: $fileName,
+                        supportsStreaming: (bool) ($extra['supports_streaming'] ?? true),
+                        duration: $duration,
+                        width: $width,
+                        height: $height,
+                        cancellation: $cancellation,
+                    ),
+                    'animation' => $this->uploadGif(file: $media, thumb: $thumb, peer: $peer, fileName: $fileName, duration: $duration, width: $width, height: $height, cancellation: $cancellation),
+                    'audio' => $this->uploadAudio(
+                        file: $media,
+                        thumb: $thumb,
+                        peer: $peer,
+                        fileName: $fileName,
+                        duration: $duration,
+                        title: isset($extra['title']) ? (string) $extra['title'] : null,
+                        performer: isset($extra['performer']) ? (string) $extra['performer'] : null,
+                        cancellation: $cancellation,
+                    ),
+                    'voice_note' => $this->uploadVoice(peer: $peer ?? 'me', file: $media, fileName: $fileName, duration: $duration, cancellation: $cancellation),
+                    default => $this->uploadDocument(file: $media, thumb: $thumb, peer: $peer, fileName: $fileName, cancellation: $cancellation),
+                };
+            }
+            if ($media instanceof BotApiFileId) {
+                $media = $media->fileId;
+            }
+            $info = $this->getFileInfo($media);
+            return $info['InputPhoto'] ?? $info['InputDocument'] ?? throw new Exception("The specified $type can't be used in a rich message");
+        });
+    }
+    /**
+     * Extract a message ID from an Updates constructor.
+     */
+    public function extractMessageId(array $updates): int
+    {
+        return $this->extractMessage($updates)['id'];
+    }
+    /**
+     * Extract a message constructor from an Updates constructor.
+     */
+    public function extractMessage(array $updates): array
+    {
+        return ($this->extractMessageUpdate($updates))['message'];
+    }
+    /**
+     * Extract an update message constructor from an Updates constructor.
+     */
+    public function extractMessageUpdate(array $updates): array
+    {
+        $result = null;
+        foreach (($this->extractUpdates($updates)) as $update) {
+            if (\in_array($update['_'], ['updateNewMessage', 'updateNewChannelMessage', 'updateEditMessage', 'updateEditChannelMessage', 'updateNewScheduledMessage', 'updateNewEncryptedMessage', 'updateNewOutgoingEncryptedMessage'], true)) {
+                if ($result !== null) {
+                    throw new Exception('Found more than one update of type message, use extractUpdates to extract all updates');
+                }
+                $result = $update;
+            }
+        }
+        if ($result === null) {
+            $updates = json_encode($updates);
+            throw new Exception("Could not find any message in $updates!");
+        }
+        return $result;
+    }
+    /**
+     * Extract Update constructors from an Updates constructor.
+     *
+     * @return array<array>
+     */
+    public function extractUpdates(array $updates): array
+    {
+        switch ($updates['_']) {
+            case 'updates':
+            case 'updatesCombined':
+                return $updates['updates'];
+            case 'updateShort':
+                return [$updates['update']];
+            case 'updateShortSentMessage':
+                $updates['user_id'] = $this->getInfo($updates['request']['body']['peer'], API::INFO_TYPE_ID);
+                // no break
+            case 'updateShortMessage':
+            case 'updateShortChatMessage':
+                $updates = $this->mergeSentRequest($updates);
+                $from_id = $updates['from_id'] ?? ($updates['out'] ? $this->authorization['user']['id'] : $updates['user_id']);
+                $to_id = $updates['chat_id'] ?? ($updates['out'] ? $updates['user_id'] : $this->authorization['user']['id']);
+                $message = $updates;
+                $message['_'] = 'message';
+                $message['from_id'] = $from_id;
+                $message['peer_id'] = $to_id;
+                $this->populateMessageFlags($message);
+                return [['_' => 'updateNewMessage', 'message' => $message, 'pts' => $updates['pts'], 'pts_count' => $updates['pts_count']]];
+            case 'updateNewOutgoingEncryptedMessage':
+                return [$updates];
+            default:
+                throw new ResponseException('Unrecognized update received: '.$updates['_']);
+        }
+    }
+    /**
+     * Fill a short message update with the parameters of the request that sent it.
+     *
+     * The request has the input types of the method (InputReplyTo, InputMedia, ...), not the ones of the message.
+     */
+    private function mergeSentRequest(array $updates): array
+    {
+        $body = $updates['request']['body'] ?? [];
+        // The media actually sent, if any, is in the update itself.
+        unset($updates['request'], $body['media'], $body['rich_message']);
+        $getId = fn (mixed $peer): int => $this->getInfo($peer, API::INFO_TYPE_ID);
+        if (isset($body['reply_to'])) {
+            $body['reply_to'] = self::inputReplyToHeader(
+                $body['reply_to'],
+                isset($body['reply_to']['top_msg_id']) && $this->isForum($body['peer']),
+                $getId,
+            );
+        }
+        if (isset($body['entities'])) {
+            $body['entities'] = self::inputEntitiesToMessage($body['entities'], $getId);
+        }
+        return array_merge($body, $updates);
+    }
+    /**
+     * Convert the entities of a request into the ones of the message it sent.
+     *
+     * @internal
+     *
+     * @param list<array>          $entities
+     * @param \Closure(mixed): int $getId
+     *
+     * @return list<array>
+     */
+    public static function inputEntitiesToMessage(array $entities, \Closure $getId): array
+    {
+        foreach ($entities as &$entity) {
+            if ($entity['_'] === 'inputMessageEntityMentionName') {
+                $entity = [
+                    '_' => 'messageEntityMentionName',
+                    'offset' => $entity['offset'],
+                    'length' => $entity['length'],
+                    'user_id' => $getId($entity['user_id']),
+                ];
+            }
+        }
+        unset($entity);
+        return $entities;
+    }
+    /**
+     * Convert the InputReplyTo of a request into the MessageReplyHeader of the message it sent.
+     *
+     * @internal
+     *
+     * @param \Closure(mixed): int $getId
+     */
+    public static function inputReplyToHeader(array $replyTo, bool $forum, \Closure $getId): ?array
+    {
+        switch ($replyTo['_'] ?? null) {
+            case 'inputReplyToMessage':
+                $header = [
+                    '_' => 'messageReplyHeader',
+                    'reply_to_scheduled' => false,
+                    'forum_topic' => $forum,
+                    'quote' => isset($replyTo['quote_text']),
+                    'reply_to_ephemeral' => false,
+                ];
+                $msgId = $replyTo['reply_to_msg_id'] ?? null;
+                $topId = $replyTo['top_msg_id'] ?? null;
+                if (!$msgId || $msgId === $topId) {
+                    // A message at the root of a thread replies to its top message.
+                    $msgId = $topId;
+                    $topId = null;
+                }
+                if ($msgId !== null) {
+                    $header['reply_to_msg_id'] = $msgId;
+                }
+                if ($topId !== null) {
+                    $header['reply_to_top_id'] = $topId;
+                }
+                if (isset($replyTo['reply_to_peer_id'])) {
+                    $header['reply_to_peer_id'] = $getId($replyTo['reply_to_peer_id']);
+                }
+                foreach (['quote_text', 'quote_offset', 'todo_item_id', 'poll_option'] as $key) {
+                    if (isset($replyTo[$key])) {
+                        $header[$key] = $replyTo[$key];
+                    }
+                }
+                if (isset($replyTo['quote_entities'])) {
+                    $header['quote_entities'] = self::inputEntitiesToMessage($replyTo['quote_entities'], $getId);
+                }
+                return $header;
+            case 'inputReplyToStory':
+                return [
+                    '_' => 'messageReplyStoryHeader',
+                    'peer' => $getId($replyTo['peer']),
+                    'story_id' => $replyTo['story_id'],
+                ];
+            default:
+                return null;
+        }
+    }
+    private function populateMessageFlags(array &$message): void
+    {
+        $new = ['_' => 'message'];
+        foreach ($this->TL->getConstructors()->findByPredicate('message')['params'] as $param) {
+            if (isset($message[$param['name']]) && $param['name'] !== 'flags') {
+                $new[$param['name']] = $message[$param['name']];
+            } elseif ($param['type'] === 'true') {
+                $new[$param['name']] = false;
+            }
+        }
+        $message = $new;
+    }
+    /**
+     * @param array $updates        Updates
+     * @param array $actual_updates Actual updates for deferred
+     * @internal
+     */
+    public function handleUpdates(array $updates, ?array $actual_updates = null): void
+    {
+        if ($actual_updates) {
+            $updates = $actual_updates;
+        }
+        $this->logger->logger('Parsing updates ('.$updates['_'].') received via the socket...', Logger::VERBOSE);
+        switch ($updates['_']) {
+            case 'updates':
+            case 'updatesCombined':
+                $result = [];
+                foreach ($updates['updates'] as $key => $update) {
+                    if ($update['_'] === 'updateNewMessage' || $update['_'] === 'updateReadMessagesContents' || $update['_'] === 'updateEditMessage' || $update['_'] === 'updateDeleteMessages' || $update['_'] === 'updateReadHistoryInbox' || $update['_'] === 'updateReadHistoryOutbox' || $update['_'] === 'updateWebPage' || $update['_'] === 'updateMessageID') {
+                        $result[$this->feeders[FeedLoop::GENERIC]->feedSingle($update)] = true;
+                        unset($updates['updates'][$key]);
+                    }
+                }
+                $this->seqUpdater->addPendingWakeups($result);
+                if ($updates['updates']) {
+                    if ($updates['_'] === 'updatesCombined') {
+                        $updates['options'] = ['seq_start' => $updates['seq_start'], 'seq_end' => $updates['seq'], 'date' => $updates['date']];
+                    } else {
+                        $updates['options'] = ['seq_start' => $updates['seq'], 'seq_end' => $updates['seq'], 'date' => $updates['date']];
+                    }
+                    $this->seqUpdater->feed($updates);
+                }
+                $this->seqUpdater->resume();
+                break;
+            case 'updateShort':
+                $this->feeders[$this->feeders[FeedLoop::GENERIC]->feedSingle($updates['update'])]->resume();
+                break;
+            case 'updateShortSentMessage':
+                if (!isset($updates['request']['body'])) {
+                    break;
+                }
+                $updates['user_id'] = $this->getInfo($updates['request']['body']['peer'], API::INFO_TYPE_ID);
+                // no break
+            case 'updateShortMessage':
+            case 'updateShortChatMessage':
+                $updates = $this->mergeSentRequest($updates);
+                $from_id = $updates['from_id'] ?? ($updates['out'] ? $this->authorization['user']['id'] : $updates['user_id']);
+                $to_id = $updates['chat_id'] ?? ($updates['out'] ? $updates['user_id'] : $this->authorization['user']['id']);
+                if (!(($this->peerIsset($from_id)) || !(($this->peerIsset($to_id)) || isset($updates['via_bot_id']) && !(($this->peerIsset($updates['via_bot_id'])) || isset($updates['entities']) && !(($this->entitiesPeerIsset($updates['entities'])) || isset($updates['fwd_from']) && !($this->fwdPeerIsset($updates['fwd_from']))))))) {
+                    $this->updaters[FeedLoop::GENERIC]->resume();
+                    return;
+                }
+                $message = $updates;
+                $message['_'] = 'message';
+                $message['from_id'] = $from_id;
+                $message['peer_id'] = $to_id;
+                $this->populateMessageFlags($message);
+                $update = ['_' => 'updateNewMessage', 'message' => $message, 'pts' => $updates['pts'], 'pts_count' => $updates['pts_count']];
+                $this->feeders[$this->feeders[FeedLoop::GENERIC]->feedSingle($update)]->resume();
+                break;
+            case 'updatesTooLong':
+                $this->updaters[UpdateLoop::GENERIC]->resume();
+                break;
+            default:
+                throw new ResponseException('Unrecognized update received: '.var_export($updates, true));
+                break;
+        }
+    }
+    /**
+     * Subscribe to event handler updates for a channel/supergroup we're not a member of.
+     *
+     * @param mixed $channel Channel/supergroup to subscribe to
+     *
+     * @return bool False if we were already subscribed
+     */
+    public function subscribeToUpdates(mixed $channel): bool
+    {
+        $channelId = $this->getId($channel);
+        if (!DialogId::isSupergroupOrChannelOrMonoforum($channelId)) {
+            throw new Exception("You can only subscribe to channels or supergroups!");
+        }
+        if (!$this->getChannelStates()->has($channelId)) {
+            $this->loadChannelState($channelId, ['_' => 'updateChannelTooLong', 'pts' => 1]);
+            $this->feeders[$channelId] ??= new FeedLoop($this, $channelId);
+            $this->updaters[$channelId] ??= new UpdateLoop($this, $channelId);
+            $this->feeders[$channelId]->start();
+            if (isset($this->feeders[$channelId])) {
+                $this->feeders[$channelId]->resume();
+            }
+            $this->updaters[$channelId]->start();
+            if (isset($this->updaters[$channelId])) {
+                $this->updaters[$channelId]->resume();
+            }
+            return true;
+        }
+        return false;
+    }
+    /**
+     * Save update.
+     *
+     * @param array $update Update to save
+     * @internal
+     */
+    public function saveUpdate(array $update): void
+    {
+        $this->logger->logger("Saving update of type {$update['_']}", Logger::VERBOSE);
+        if ($this->referenceDatabase !== null && $this->settings->getDb()->getEnableFileReferenceDb()) {
+            // Extracted, deduplicated and reordered by the update system, short updates converted to updates.
+            $this->referenceDatabase->onUpdate($update);
+        }
+        if ($update['_'] === 'updateConfig') {
+            $this->config['expires'] = 0;
+            $this->getConfig();
+        }
+        if ($update['_'] === 'updateLoginToken') {
+            try {
+                $authorization = $this->methodCallAsyncRead(
+                    'auth.exportLoginToken',
+                    [
+                        'api_id' => $this->settings->getAppInfo()->getApiId(),
+                        'api_hash' => $this->settings->getAppInfo()->getApiHash(),
+                        'specialMethodType' => SpecialMethodType::USER_RELATED,
+                    ],
+                );
+                if ($authorization['_'] === 'auth.loginTokenMigrateTo') {
+                    $datacenter = $this->isTestMode() ? 10_000 + $authorization['dc_id'] : $authorization['dc_id'];
+                    $this->loginState->publish($this->loginState->getState()->setDc($datacenter));
+                    $authorization['specialMethodType'] = SpecialMethodType::USER_RELATED;
+                    $authorization = $this->methodCallAsyncRead(
+                        'auth.importLoginToken',
+                        $authorization,
+                    );
+                }
+            } catch (SessionPasswordNeededError) {
+                $this->logger->logger(Lang::$current_lang['login_2fa_enabled'], Logger::NOTICE);
+                $this->authorization = $this->getPassword();
+                if (!isset($this->authorization['hint'])) {
+                    $this->authorization['hint'] = '';
+                }
+                $this->setLoginState(API::WAITING_PASSWORD);
+                $this->qrLoginDeferred?->cancel();
+                $this->qrLoginDeferred = null;
+                return;
+            }
+            return;
+        }
+        if (
+            \in_array($update['_'], ['updateChannel', 'updateUser', 'updateUserName', 'updateUserPhone', 'updateUserBlocked', 'updateUserPhoto', 'updateContactRegistered', 'updateContactLink', 'updatePeerBlocked'], true)
+            || (
+                $update['_'] === 'updateNewChannelMessage'
+                && isset($update['message']['action']['_'])
+                && \in_array($update['message']['action']['_'], ['messageActionChatEditTitle', 'messageActionChatEditPhoto', 'messageActionChatDeletePhoto', 'messageActionChatMigrateTo', 'messageActionChannelMigrateFrom', 'messageActionGroupCall'], true)
+            )
+        ) {
+            $id = $this->getIdInternal($update);
+            \assert($id !== null);
+            EventLoop::queue(function () use ($id): void {
+                try {
+                    $this->refreshPeerCache($id);
+                    if ($this->getSettings()->getDb()->getEnableFullPeerDb()) {
+                        $this->peerDatabase->expireFull($id);
+                    }
+                } catch (ChannelPrivateError|MsgIdInvalidError|PeerNotInDbException|FloodWaitError) {
+                }
+            });
+        }
+        if ($update['_'] === 'updateDcOptions') {
+            $this->logger->logger('Got new dc options', Logger::VERBOSE);
+            $this->config['dc_options'] = $update['dc_options'];
+            $this->parseConfig();
+            return;
+        }
+        if ($update['_'] === 'updatePhoneCallSignalingData') {
+            if (isset($this->calls[$update['phone_call_id']])) {
+                EventLoop::queue($this->calls[$update['phone_call_id']]->onSignaling(...), (string) $update['data']);
+            }
+        }
+        if ($update['_'] === 'updateGroupCall'
+            || $update['_'] === 'updateGroupCallParticipants'
+            || $update['_'] === 'updateGroupCallChainBlocks'
+            || $update['_'] === 'updateGroupCallEncryptedMessage'
+        ) {
+            // Group call updates must be applied synchronously and in order, exclusively from here:
+            // never invoke the controller's handlers directly, or a version gap could be filled out
+            // of sequence. updateGroupCallConnection is not handled here: it carries no call ID and
+            // is only ever returned by phone.joinGroupCall, so it is extracted from that response.
+            // The chain-block and encrypted-message updates drive end-to-end conference calls.
+            $this->handleGroupCallUpdate($update);
+        }
+        if ($update['_'] === 'updatePhoneCall') {
+            if (!$this->postponeCallUpdate($update)) {
+                $this->applyCallUpdate($update);
+            }
+            return;
+        }
+        if ($update['_'] === 'updateNewEncryptedMessage' && !isset($update['message']['decrypted_message'])) {
+            if (isset($update['qts'])) {
+                $cur_state = ($this->loadUpdateState());
+                if ($cur_state->qts() === -1) {
+                    $cur_state->qts($update['qts']);
+                }
+                if ($update['qts'] < $cur_state->qts()) {
+                    $this->logger->logger('Duplicate update. update qts: '.$update['qts'].' <= current qts '.$cur_state->qts().', chat id: '.$update['message']['chat_id'], Logger::ERROR);
+                    return;
+                }
+                if ($update['qts'] > $cur_state->qts() + 1) {
+                    $this->logger->logger('Qts hole. Fetching updates manually: update qts: '.$update['qts'].' > current qts '.$cur_state->qts().'+1, chat id: '.$update['message']['chat_id'], Logger::ERROR);
+                    $this->updaters[UpdateLoop::GENERIC]->resume();
+                    return;
+                }
+                $this->logger->logger('Applying qts: '.$update['qts'].' over current qts '.$cur_state->qts().', chat id: '.$update['message']['chat_id'], Logger::VERBOSE);
+                $this->methodCallAsyncRead('messages.receivedQueue', ['max_qts' => $cur_state->qts($update['qts'])]);
+            }
+            EventLoop::queue(function () use ($update): void {
+                if (!isset($this->secretChats[$update['message']['chat_id']])) {
+                    $this->logger->logger(\sprintf(Lang::$current_lang['secret_chat_skipping'], $update['message']['chat_id']));
+                    return;
+                }
+                $this->secretChats[$update['message']['chat_id']]->feed($update);
+            });
+            return;
+        }
+        if ($update['_'] === 'updateEncryption') {
+            EventLoop::queue(function () use ($update): void {
+                switch ($update['chat']['_']) {
+                    case 'encryptedChatRequested':
+                        if (!$this->settings->getSecretChats()->canAccept($update['chat']['admin_id'])) {
+                            return;
+                        }
+                        $this->logger->logger('Accepting secret chat '.$update['chat']['id'], Logger::NOTICE);
+                        try {
+                            $this->acceptSecretChat($update['chat']);
+                        } catch (RPCErrorException $e) {
+                            $this->logger->logger("Error while accepting secret chat: {$e}", Logger::FATAL_ERROR);
+                        }
+                        break;
+                    case 'encryptedChatDiscarded':
+                        // Discarded by the other party, or accepted by another session of the account: forget it
+                        // without echoing a messages.discardEncryption, which is only for chats we close ourselves.
+                        $this->logger->logger('Deleting secret chat '.$update['chat']['id'].' because it was revoked by the other user (it was probably accepted by another client)', Logger::NOTICE);
+                        unset($this->secretChats[$update['chat']['id']], $this->temp_requested_secret_chats[$update['chat']['id']]);
+                        break;
+                    case 'encryptedChat':
+                        $this->logger->logger('Completing creation of secret chat '.$update['chat']['id'], Logger::NOTICE);
+                        $this->completeSecretChat($update['chat']);
+                        break;
+                }
+            });
+            //$this->logger->logger($update, \danog\MadelineProto\Logger::NOTICE);
+        }
+        if ($this->updateHandlerType === UpdateHandlerType::NOOP) {
+            return;
+        }
+        if (isset($update['message']['_']) && $update['message']['_'] === 'messageEmpty') {
+            return;
+        }
+        if (isset($update['message']['from_id'])
+            && $update['message']['from_id'] > 0
+        ) {
+            if ($update['message']['from_id'] === $this->authorization['user']['id']) {
+                $update['message']['out'] = true;
+            }
+        } elseif (!isset($update['message']['from_id'])
+            && isset($update['message']['peer_id'])
+            && $update['message']['peer_id'] > 0
+            && $update['message']['peer_id'] === $this->authorization['user']['id']) {
+            $update['message']['out'] = true;
+        }
+
+        if (!isset($update['message']['from_id'])
+            && isset($update['message']['peer_id'])
+            && $update['message']['peer_id'] > 0
+        ) {
+            $update['message']['from_id'] = $update['message']['peer_id'];
+        }
+
+        $this->handleUpdate($update);
+    }
+    /**
+     * Apply an [updatePhoneCall](https://core.telegram.org/constructor/updatePhoneCall) to its call, then
+     * dispatch it, see {@see self::postponeCallUpdate()}.
+     */
+    private function applyCallUpdate(array $update): void
+    {
+        switch ($update['phone_call']['_']) {
+            case 'phoneCallRequested':
+                // Ringing on every session of the account: only the one that accepts it will be in
+                // it, see PrivateCallController::accept() and onDiscarded().
+                if (isset($this->calls[$update['phone_call']['id']])) {
+                    return;
+                }
+                $this->calls[$update['phone_call']['id']] = $controller = new PrivateCallController(
+                    $this,
+                    $update['phone_call'],
+                );
+                $this->callsByPeer[$controller->public->otherID] = $controller;
+                $update['phone_call'] = $controller->public;
+                break;
+            case 'phoneCallWaiting':
+                // The state of an outgoing call, which requestCall() tracks from the result of
+                // phone.requestCall (the updates that come before it are postponed until then, see
+                // postponeCallUpdate()): any other one was requested by another session of the account
+                // (as TDLib, only create calls from phoneCallRequested), and tracking it would make
+                // this session confirm or discard a call it is not in. It carries nothing to apply to
+                // a call we track.
+                return;
+            case 'phoneCallAccepted':
+                if (!isset($this->calls[$update['phone_call']['id']])) {
+                    return;
+                }
+                $controller = $this->calls[$update['phone_call']['id']];
+                $controller->confirm($update['phone_call']);
+                $update['phone_call'] = $controller->public;
+                break;
+            case 'phoneCall':
+                if (!isset($this->calls[$update['phone_call']['id']])) {
+                    return;
+                }
+                $controller = $this->calls[$update['phone_call']['id']];
+                $controller->complete($update['phone_call']);
+                $update['phone_call'] = $controller->public;
+                break;
+            case 'phoneCallDiscarded':
+                if (!isset($this->calls[$update['phone_call']['id']])) {
+                    return;
+                }
+                $controller = $this->calls[$update['phone_call']['id']];
+                $controller->onDiscarded($update['phone_call']);
+                $update['phone_call'] = $controller->public;
+                break;
+            case 'phoneCallEmpty':
+                return;
+        }
+        if ($this->updateHandlerType !== UpdateHandlerType::NOOP) {
+            $this->handleUpdate($update);
+        }
+    }
+    /**
+     * Handle the updates postponed while the event handler is starting, once it started.
+     *
+     * @param Future<mixed> $started
+     */
+    private function handlePostponedUpdates(Future $started): void
+    {
+        if ($this->updateQueueReplay) {
+            return;
+        }
+        $this->updateQueueReplay = true;
+        $started->map(function (): void {
+            $this->updateQueueReplay = false;
+            // Only the updates postponed until now: if the event handler failed to start, they're postponed again
+            // until it's started again, instead of being postponed and handled again in an endless loop.
+            for ($x = $this->updateQueue->count(); $x > 0; $x--) {
+                $this->handleUpdate($this->updateQueue->dequeue());
+            }
+        });
+    }
+    private ?BetterCounter $updateCtr;
+    private function handleUpdate(array $update): void
+    {
+        $this->updateCtr?->inc(['type' => $update['_']]);
+        /** @var UpdateHandlerType::EVENT_HANDLER|UpdateHandlerType::WEBHOOK|UpdateHandlerType::GET_UPDATES $this->updateHandlerType */
+        match ($this->updateHandlerType) {
+            // Custom events can be sent before an update handler is set (for example, in the onStart of the event handler).
+            UpdateHandlerType::NOOP => null,
+            UpdateHandlerType::EVENT_HANDLER => $this->eventUpdateHandler($update),
+            UpdateHandlerType::WEBHOOK => EventLoop::queue($this->pwrWebhook(...), $update),
+            UpdateHandlerType::GET_UPDATES => EventLoop::queue($this->addGetUpdatesUpdate(...), $update),
+        };
+    }
+    /**
+     * Sends an updateCustomEvent update to the event handler.
+     */
+    public function sendCustomEvent(mixed $payload): void
+    {
+        $this->handleUpdate(['_' => 'updateCustomEvent', 'payload' => $payload]);
+    }
+}

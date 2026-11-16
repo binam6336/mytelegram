@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:noNamespaceSchemaLocation="https://schema.phpunit.de/9.3/phpunit.xsd"
+  backupGlobals="false"
+  backupStaticAttributes="false"
+  bootstrap="vendor/autoload.php"
+  colors="true"
+  convertErrorsToExceptions="true"
+  convertNoticesToExceptions="true"
+  convertWarningsToExceptions="true"
+  processIsolation="false"
+>
+  <coverage>
+    <include>
+      <directory suffix=".php">src</directory>
+    </include>
+  </coverage>
+  <testsuites>
+    <testsuite name="Main">
+      <directory>tests</directory>
+    </testsuite>
+  </testsuites>
+  <extensions>
+    <!-- Fails a test that waits forever, after dumping where it waits: see tests/danog/MadelineProto/Watchdog.php -->
+    <extension class="danog\MadelineProto\Test\Watchdog">
+      <arguments>
+        <integer>600</integer>
+      </arguments>
+    </extension>
+  </extensions>
+</phpunit>

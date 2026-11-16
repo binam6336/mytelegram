@@ -1,0 +1,110 @@
+<?xml version="1.0"?>
+<psalm
+        errorLevel="2"
+        resolveFromConfigFile="true"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xmlns="https://getpsalm.org/schema/config"
+        xsi:schemaLocation="https://getpsalm.org/schema/config vendor/vimeo/psalm/config.xsd"
+>
+    <projectFiles>
+        <directory name="examples"/>
+        <directory name="src"/>
+        <ignoreFiles>
+            <directory name="vendor"/>
+        </ignoreFiles>
+    </projectFiles>
+
+    <issueHandlers>
+        <DuplicateClass>
+            <errorLevel type="suppress">
+                <directory name="examples"/>
+            </errorLevel>
+        </DuplicateClass>
+
+        <InvalidOperand>
+            <errorLevel type="suppress">
+                <directory name="src/EventLoop/Driver"/>
+                <file name="src/EventLoop.php"/>
+            </errorLevel>
+        </InvalidOperand>
+
+        <MissingClosureParamType>
+            <errorLevel type="suppress">
+                <directory name="examples"/>
+                <directory name="src"/>
+            </errorLevel>
+        </MissingClosureParamType>
+
+        <MissingClosureReturnType>
+            <errorLevel type="suppress">
+                <directory name="examples"/>
+                <directory name="src"/>
+            </errorLevel>
+        </MissingClosureReturnType>
+
+        <PossiblyInvalidArgument>
+            <errorLevel type="suppress">
+                <directory name="examples"/>
+                <file name="src/EventLoop/Driver/UvDriver.php"/>
+            </errorLevel>
+        </PossiblyInvalidArgument>
+
+        <PossiblyUnusedMethod>
+            <errorLevel type="suppress">
+                <directory name="src"/>
+            </errorLevel>
+        </PossiblyUnusedMethod>
+
+        <PossiblyUnusedParam>
+            <errorLevel type="suppress">
+                <directory name="src"/>
+            </errorLevel>
+        </PossiblyUnusedParam>
+
+        <PossiblyUnusedReturnValue>
+            <errorLevel type="suppress">
+                <directory name="src"/>
+            </errorLevel>
+        </PossiblyUnusedReturnValue>
+
+        <RedundantConditionGivenDocblockType>
+            <errorLevel type="suppress">
+                <directory name="src"/>
+            </errorLevel>
+        </RedundantConditionGivenDocblockType>
+
+        <StringIncrement>
+            <errorLevel type="suppress">
+                <directory name="examples"/>
+                <directory name="src"/>
+            </errorLevel>
+        </StringIncrement>
+
+        <UnsupportedPropertyReferenceUsage>
+            <errorLevel type="suppress">
+                <directory name="src"/>
+            </errorLevel>
+        </UnsupportedPropertyReferenceUsage>
+
+        <UnusedFunctionCall>
+            <errorLevel type="suppress">
+                <file name="src/EventLoop/Driver/UvDriver.php"/>
+            </errorLevel>
+        </UnusedFunctionCall>
+
+        <UnusedVariable>
+            <errorLevel type="suppress">
+                <file name="src/EventLoop/Driver/EvDriver.php"/>
+                <file name="src/EventLoop/Driver/EventDriver.php"/>
+            </errorLevel>
+        </UnusedVariable>
+    </issueHandlers>
+
+    <stubs>
+        <file name="vendor/jetbrains/phpstorm-stubs/Ev/Ev.php"/>
+        <file name="vendor/jetbrains/phpstorm-stubs/event/event.php"/>
+        <file name="vendor/jetbrains/phpstorm-stubs/uv/UV.php"/>
+        <file name="vendor/jetbrains/phpstorm-stubs/uv/uv_functions.php"/>
+        <file name="stubs/uv.php"/>
+    </stubs>
+</psalm>

@@ -1,0 +1,83 @@
+<?php
+
+/**
+ * This file is part of the PHP WebRTC package.
+ *
+ * (c) Amin Yazdanpanah <https://www.aminyazdanpanah.com/#contact>
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Webrtc\Codecs\Video\X264;
+
+use Webrtc\AVCodec\AVCodec;
+use Webrtc\AVCodec\Codec;
+use Webrtc\AVCodec\Context\VideoContext;
+use Webrtc\AVCodec\Data\Packet;
+use Webrtc\AVCodec\Exception\AvCodecException;
+use Webrtc\AVCodec\TransCoder;
+use Webrtc\Codecs\DecoderInterface;
+use Webrtc\Codecs\JitterFrameInterface;
+use Webrtc\Exception\WebrtcExceptionInterface;
+
+/**
+ * H.264 Video Decoder Class
+ *
+ * Implements decoding of H.264/AVC video streams for WebRTC applications.
+ * Provides efficient frame-by-frame decoding with proper timestamp handling.
+ *
+ * @package Webrtc\Codecs\Video\X264
+ */
+final class H264Decoder implements DecoderInterface
+{
+    /**
+     * @var TransCoder $transcoder H.264 transcoder instance
+     */
+    private TransCoder $transcoder;
+
+    /**
+     * Constructor
+     *
+     * Initializes the H.264 decoder with:
+     * - AVCodec library
+     * - H.264 codec context in read mode
+     * - Default decoder configuration
+     * @throws AvCodecException
+     */
+    public function __construct()
+    {
+        AVCodec::init();
+        $context = VideoContext::create(new Codec("h264"));
+        \assert($context instanceof VideoContext);
+        $this->transcoder = new TransCoder($context);
+    }
+
+    /**
+     * Decodes an H.264 encoded frame
+     *
+     * @param JitterFrameInterface $frame Input frame containing:
+     *                          - Data: Encoded H.264 payload
+     *                          - timestamp: Presentation timestamp
+     * @return array Array of decoded VideoFrame objects
+     *               Empty array on decoding failure
+     */
+    #[\Override]
+    public function decode(JitterFrameInterface $frame): array
+    {
+        try {
+            $packet = new Packet();
+            $packet->putData($frame->getData());
+            $packet->setPts($frame->getTimestamp()); // Set presentation timestamp
+            $packet->setTimeBase(1, 90000);   // Set time base
+
+            return $this->transcoder->decode($packet);
+        } catch (WebrtcExceptionInterface) {
+            // A decode failure (malformed bitstream) legitimately yields no frames; catching only
+            // library-domain exceptions lets genuine programming errors surface instead of being
+            // silently swallowed as an empty decode on the hot path.
+            return [];
+        }
+    }
+}
+

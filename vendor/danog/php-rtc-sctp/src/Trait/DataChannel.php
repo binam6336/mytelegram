@@ -1,0 +1,669 @@
+<?php declare(strict_types=1);
+
+/**
+ * This file is part of the PHP WebRTC package.
+ *
+ * (c) Amin Yazdanpanah <https://www.aminyazdanpanah.com/#contact>
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Webrtc\SCTP\Trait;
+
+use Webrtc\DataChannel\Enum\State as DataChannelState;
+use Webrtc\DataChannel\RTCDataChannel;
+use Webrtc\DataChannel\RTCDataChannelParameters;
+use Webrtc\Exception\InvalidArgumentException;
+use Webrtc\Exception\RuntimeException;
+use Webrtc\SCTP\Chunk\Chunk;
+use Webrtc\SCTP\Chunk\DataChunk;
+use Webrtc\SCTP\Chunk\ForwardTsnChunk;
+use Webrtc\SCTP\Enum\State;
+use Webrtc\SCTP\Param\StreamResetOutgoingParam;
+use Webrtc\SCTP\SctpConstant;
+use Webrtc\SCTP\SctpUtility;
+use Revolt\EventLoop;
+use SplQueue;
+
+/**
+ * Trait DataChannel.
+ *
+ * Provides support for managing SCTP-based WebRTC data channels.
+ * Includes timers, retransmissions, congestion control, data flushing,
+ * and stream lifecycle management.
+ */
+trait DataChannel
+{
+    private ?string $dataChannelTask = null;
+    private ?int $dataChannelId = null;
+    /** @var SplQueue<array{0: RTCDataChannel, 1: int, 2: string}> */
+    private SplQueue $dataChannelQueue;
+    /** @var array<int, RTCDataChannel> */
+    private array $dataChannels = [];
+
+    /**
+     *  Returns the current data channel timer.
+     *
+     */
+    public function getDataChannelTask(): ?string
+    {
+        return $this->dataChannelTask;
+    }
+
+    /**
+     * Handler for data channel task expiration.
+     * Clears retransmission states and resets congestion control.
+     *
+     */
+    public function dataChannelTaskExpired(): void
+    {
+        $this->dataChannelTask = null;
+        $this->log(" DataChannel task expired!");
+
+        // Mark retransmitting or abandoned chunks
+        foreach ($this->sentQueue as $chunk) {
+            if (!$this->maybeAbandon($chunk)) {
+                $chunk->getAttributes()->retransmit = true;
+            }
+        }
+        $this->updateAdvancedPeerAckPoint();
+
+        // Adjust a congestion window
+        $this->fastRecoveryExit = null;
+        $this->flightSize = 0;
+        $this->partialBytesAcked = 0;
+
+        $this->ssthresh = max(intdiv($this->cwnd, 2), 4 * SctpConstant::USERDATA_MAX_LENGTH);
+        $this->cwnd = SctpConstant::USERDATA_MAX_LENGTH;
+
+        EventLoop::queue(fn () => $this->transmit());
+    }
+
+    /**
+     * Restarts the data channel timer.
+     *
+     */
+    private function dataChannelTaskRestart(): void
+    {
+        $this->log(" Datachannel timer restarted");
+        if ($this->dataChannelTask !== null) {
+            EventLoop::cancel($this->dataChannelTask);
+            $this->dataChannelTask = null;
+        }
+        $this->armDataChannelTimer();
+    }
+
+    /**
+     * Arm the data-channel retransmission timer without pinning the transport.
+     *
+     * Registering it as $this->dataChannelTaskExpired(...) captures $this strongly and would keep
+     * the event loop holding this SCTP transport alive forever, defeating an unset()+gc cycle.
+     * A weak reference lets the transport be collected; an orphaned timer fires once into nothing.
+     */
+    private function armDataChannelTimer(): void
+    {
+        $weak = \WeakReference::create($this);
+        $this->dataChannelTask = EventLoop::delay($this->rto, static function () use ($weak): void {
+            $weak->get()?->dataChannelTaskExpired();
+        });
+    }
+
+    /**
+     * Starts the data channel timer if not already running.
+     *
+     * @throws RuntimeException if already started.
+     */
+    private function dataChannelTaskStart(): void
+    {
+        if ($this->dataChannelTask !== null) {
+            throw new RuntimeException("Datachannel timer already started");
+        }
+        $this->log(" Datachannel timer started");
+        $this->armDataChannelTimer();
+    }
+
+    /**
+     * Cancels the running data channel timer, if any.
+     */
+    public function dataChannelTaskCancel(): void
+    {
+        if ($this->dataChannelTask !== null) {
+            $this->log(" Datachannel timer canceled");
+            EventLoop::cancel($this->dataChannelTask);
+            $this->dataChannelTask = null;
+        }
+    }
+
+    /**
+     *
+     * Processes and sends the forward TSN chunk if it exists.
+     * If there is no forward TSN chunk, it does nothing.
+     * Ensures the data channel task is started if it's not already running.
+     */
+    private function processForwardTsn(): void
+    {
+        if ($this->forwardTsnChunk !== null) {
+            $this->sendChunk($this->forwardTsnChunk);
+            $this->forwardTsnChunk = null;
+            if ($this->dataChannelTask === null) {
+                $this->dataChannelTaskStart();
+            }
+        }
+    }
+
+    /**
+     * Calculates the congestion window size (cwnd) based on the current flight size.
+     * Takes into account the fast recovery state and burst size.
+     *
+     * @return int The calculated congestion window size.
+     */
+    private function calculateCwnd(): int
+    {
+        $burstSize = ($this->fastRecoveryExit !== null)
+            ? 2 * SctpConstant::USERDATA_MAX_LENGTH
+            : 4 * SctpConstant::USERDATA_MAX_LENGTH;
+
+        return min($this->flightSize + $burstSize, $this->cwnd);
+    }
+
+    /**
+     * Handles the retransmission of chunks that need it, and the transmission of chunks
+     * from the outbound queue. It ensures that the flight size doesn’t exceed the congestion window (cwnd).
+     *
+     * @param int $cwnd The current congestion window size.
+     */
+    private function retransmitAndTransmit(int $cwnd): void
+    {
+        $retransmitEarliest = true;
+
+        // Retransmit chunks from the sent queue if they need retransmission
+        foreach ($this->sentQueue as $chunk) {
+            if ($chunk->getAttributes()->retransmit) {
+                if ($this->fastRecoveryTransmit) {
+                    $this->fastRecoveryTransmit = false;
+                } elseif ($this->flightSize >= $cwnd) {
+                    return; // Stop if flight size exceeds cwnd
+                }
+
+                $this->flightSizeIncrease($chunk);
+                $this->resetChunkRetransmitState($chunk);
+                $this->sendChunk($chunk);
+
+                if ($retransmitEarliest) {
+                    $this->dataChannelTaskRestart();
+                }
+            }
+            $retransmitEarliest = false;
+        }
+
+        // Transmit from the outbound queue if we haven't reached the congestion window size
+        while (!$this->outboundQueue->isEmpty() && $this->flightSize < $cwnd) {
+            $chunk = $this->outboundQueue->dequeue();
+            $this->sentQueue->enqueue($chunk);
+            $this->flightSizeIncrease($chunk);
+
+            // Update chunk counters and send the chunk
+            $chunk->getAttributes()->sentCount += 1;
+            $chunk->getAttributes()->sentTime = microtime(true);
+            $this->sendChunk($chunk);
+
+            // Start the datachannel task if not already running
+            $this->ensureDataChannelTaskRunning();
+        }
+    }
+
+    /**
+     * Ensures that the data channel task is running.
+     * Starts it if it is not already running.
+     */
+    private function ensureDataChannelTaskRunning(): void
+    {
+        if ($this->dataChannelTask === null) {
+            $this->dataChannelTaskStart();
+        }
+    }
+
+    /**
+     * Resets the retransmitted state of a chunk.
+     * This includes clearing the misses count, marking it as no longer needing retransmission, and incrementing the sent count.
+     *
+     * @param Chunk $chunk The chunk whose retransmit state will be reset.
+     */
+    private function resetChunkRetransmitState(Chunk $chunk): void
+    {
+        $chunk->getAttributes()->misses = 0;
+        $chunk->getAttributes()->retransmit = false;
+        $chunk->getAttributes()->sentCount += 1;
+    }
+
+    /**
+     *
+     * Main method that orchestrates the transmission process.
+     * This method:
+     * - Processes the forward TSN chunk.
+     * - Calculates the congestion window size (cwnd).
+     * - Handles retransmission of chunks and transmits chunks from the outbound queue.
+     */
+    public function transmit(): void
+    {
+        $this->processForwardTsn();
+        $cwnd = $this->calculateCwnd();
+        $this->retransmitAndTransmit($cwnd);
+    }
+
+    /**
+     * Transmit reconfiguration requests.
+     */
+    private function transmitReconfig(): void
+    {
+        if (
+            $this->state === State::ESTABLISHED &&
+            !empty($this->reconfigQueue) &&
+            $this->reconfigRequest === null
+        ) {
+            $streams = \array_slice($this->reconfigQueue, 0, SctpConstant::RECONFIG_MAX_STREAMS);
+            $this->reconfigQueue = \array_slice($this->reconfigQueue, SctpConstant::RECONFIG_MAX_STREAMS);
+
+            $param = new StreamResetOutgoingParam(
+                requestSequence: $this->reconfigRequestSeq,
+                responseSequence: $this->reconfigResponseSeq,
+                lastTsn: SctpUtility::tsnMinusOne($this->localTsn),
+                streams: $streams
+            );
+
+            $this->reconfigRequest = $param;
+            $this->reconfigRequestSeq = SctpUtility::tsnPlusOne($this->reconfigRequestSeq);
+
+            // Transmit the reconfiguration parameter asynchronously.
+            EventLoop::queue(fn () => $this->sendReconfigParam($param));
+        }
+    }
+
+    /**
+     * Update the advanced peer acknowledgment point.
+     */
+    public function updateAdvancedPeerAckPoint(): void
+    {
+        if (SctpUtility::uint32Gt($this->lastSackedTsn, $this->advancedPeerAckTsn)) {
+            $this->advancedPeerAckTsn = $this->lastSackedTsn;
+        }
+
+        $done = 0;
+        $streams = [];
+        while (!$this->sentQueue->isEmpty() && $this->sentQueue->top()->getAttributes()->abandoned) {
+            $chunk = $this->sentQueue->dequeue();
+            $this->advancedPeerAckTsn = $chunk->getTsn();
+            $done++;
+            if (!($chunk->getFlags() & SctpConstant::SCTP_DATA_UNORDERED)) {
+                $streams[$chunk->getStreamId()] = $chunk->getStreamSeq();
+            }
+        }
+
+        if ($done) {
+            // Build FORWARD TSN
+            $this->forwardTsnChunk = new ForwardTsnChunk();
+            $this->forwardTsnChunk->setCumulativeTsn($this->advancedPeerAckTsn);
+            $this->forwardTsnChunk->setStreams(array_map(static fn ($key, $value) => [$key, $value], array_keys($streams), $streams));
+        }
+    }
+
+    /**
+     * Sends data over the specified stream, fragmenting as needed.
+     */
+    public function sendDataStream(
+        int    $streamId,
+        int    $ppId,
+        string $userData,
+        ?float $expiry = 0,
+        ?int   $maxRetransmits = null,
+        ?bool  $ordered = true
+    ): void {
+        // Determine stream sequence
+        $streamSeq = $ordered ? ($this->outboundStreamSeq[$streamId] ?? 0) : 0;
+        $fragments = (int) ceil(\strlen($userData) / SctpConstant::USERDATA_MAX_LENGTH);
+        $pos = 0;
+
+        for ($fragment = 0; $fragment < $fragments; $fragment++) {
+            $chunk = new DataChunk();
+            $chunk->setFlags(0);
+            if (!$ordered) {
+                $chunk->setFlags(SctpConstant::SCTP_DATA_UNORDERED);
+            }
+            if ($fragment === 0) {
+                $chunk->setFlags($chunk->getFlags() | SctpConstant::SCTP_DATA_FIRST_FRAG);
+            }
+            if ($fragment === $fragments - 1) {
+                $chunk->setFlags($chunk->getFlags() | SctpConstant::SCTP_DATA_LAST_FRAG);
+            }
+
+            $chunk->setTsn($this->localTsn);
+            $chunk->setStreamId($streamId);
+            $chunk->setStreamSeq($streamSeq);
+            $chunk->setProtocol($ppId);
+            $chunk->setUserData(substr($userData, $pos, SctpConstant::USERDATA_MAX_LENGTH));
+
+            $chunk->getAttributes()->bookSize = \strlen($chunk->getUserData());
+            $chunk->getAttributes()->expiry = $expiry ?? 0;
+            $chunk->getAttributes()->maxRetransmits = $maxRetransmits;
+
+            $pos += SctpConstant::USERDATA_MAX_LENGTH;
+            $this->localTsn = SctpUtility::tsnPlusOne($this->localTsn);
+            $this->outboundQueue->enqueue($chunk);
+        }
+
+        if ($ordered) {
+            $this->outboundStreamSeq[$streamId] = SctpUtility::uint16Add($streamSeq, 1);
+        }
+
+        // Transmit outbound data
+        $this->transmit();
+    }
+
+    /**
+     * Requests closing a data channel by sending an Outgoing Stream Reset Request.
+     *
+     * @param RTCDataChannel $channel The channel to be closed.
+     */
+    public function dataChannelClose(RTCDataChannel $channel): void
+    {
+        if (!\in_array($channel->getReadyState(), [DataChannelState::Closing, DataChannelState::Closed], true)) {
+            $channel->setReadyState(DataChannelState::Closing);
+
+            if ($this->state == State::ESTABLISHED) {
+                $id = $channel->getId();
+                if ($id === null) {
+                    throw new RuntimeException("Cannot close a data channel that has no ID");
+                }
+                $this->reconfigQueue[] = $id;
+                if (\count($this->reconfigQueue) == 1) {
+                    $this->transmitReconfig();
+                }
+
+            } else {
+                // No stream id yet, so there is nothing to reset. Leave the queued OPEN for
+                // flush to skip; rebuilding the queue here has dropped the sibling channel's
+                // OPEN on the Windows PHP 8.4 runner.
+                $id = $channel->getId();
+                if ($id !== null) {
+                    unset($this->dataChannels[$id]);
+                }
+
+                $channel->setReadyState(DataChannelState::Closed);
+            }
+        }
+    }
+
+    /**
+     * Marks the specified data channel as closed.
+     *
+     * @param int $streamId The ID of the stream to close.
+     */
+    public function dataChannelClosed(int $streamId): void
+    {
+        if (isset($this->dataChannels[$streamId])) {
+            $channel = $this->dataChannels[$streamId];
+            $channel->setReadyState(DataChannelState::Closed);
+            unset($this->dataChannels[$streamId]);
+        }
+    }
+
+    /**
+     *
+     * Attempts to flush buffered data to the SCTP layer, waiting for the association to be established.
+     */
+    public function dataChannelFlush(): void
+    {
+        if ($this->state != State::ESTABLISHED) {
+            return;
+        }
+
+        while (!$this->dataChannelQueue->isEmpty() && $this->outboundQueue->isEmpty()) {
+            [$channel, $protocol, $userData] = $this->dataChannelQueue->dequeue();
+
+            if (\in_array($channel->getReadyState(), [DataChannelState::Closing, DataChannelState::Closed], true)) {
+                continue;
+            }
+
+            $streamId = $channel->getId();
+            if ($streamId === null) {
+                $streamId = $this->dataChannelId;
+                if ($streamId === null) {
+                    throw new RuntimeException("Cannot assign an ID to a data channel");
+                }
+                while (isset($this->dataChannels[$streamId])) {
+                    $streamId += 2;
+                }
+                $this->dataChannels[$streamId] = $channel;
+                $channel->setId($streamId);
+            }
+
+            if ($protocol === SctpConstant::WEBRTC_DCEP) {
+                $this->sendDataStream($streamId, $protocol, $userData);
+            } else {
+                $expiry = null;
+                $maxPacketLifeTime = $channel->getMaxPacketLifeTime();
+                if ($maxPacketLifeTime !== null) {
+                    $expiry = (float)time() + ((float)$maxPacketLifeTime / 1000.0);
+                }
+                $this->sendDataStream(
+                    $streamId,
+                    $protocol,
+                    $userData,
+                    $expiry,
+                    $channel->getMaxRetransmits(),
+                    $channel->getOrdered()
+                );
+                $channel->addBufferedAmount(-\strlen($userData));
+            }
+
+        }
+    }
+
+    /**
+     * Adds a negotiated data channel to the handler.
+     *
+     * @param RTCDataChannel $channel The channel to add.
+     *
+     * @throws InvalidArgumentException If the data channel ID is already registered.
+     */
+    public function dataChannelAddNegotiated(RTCDataChannel $channel): void
+    {
+        $id = $channel->getId();
+        if ($id === null) {
+            throw new InvalidArgumentException("Data channel ID is required for negotiated data channels");
+        }
+        if (isset($this->dataChannels[$id])) {
+            throw new InvalidArgumentException("Data channel with ID {$id} already registered");
+        }
+
+        $this->dataChannels[$id] = $channel;
+
+        if ($this->state == State::ESTABLISHED) {
+            $channel->setReadyState(DataChannelState::Open);
+        }
+    }
+
+    /**
+     * Opens a new data channel, registering it and setting its properties.
+     *
+     * @param RTCDataChannel $channel The channel to open.
+     *
+     * @throws InvalidArgumentException If the channel ID is already registered.
+     */
+    public function dataChannelOpen(RTCDataChannel $channel): void
+    {
+        $id = $channel->getId();
+        if ($id !== null) {
+            if (isset($this->dataChannels[$id])) {
+                throw new InvalidArgumentException("Data channel with ID {$id} already registered");
+            }
+            $this->dataChannels[$id] = $channel;
+
+        }
+        $channelType = SctpConstant::DATA_CHANNEL_RELIABLE;
+        $priority = 0;
+        $reliability = 0;
+
+        if (!$channel->getOrdered()) {
+            $channelType |= 0x80;
+        }
+        if ($channel->getMaxRetransmits() !== null) {
+            $channelType |= 1;
+            $reliability = $channel->getMaxRetransmits();
+        } elseif ($channel->getMaxPacketLifeTime() !== null) {
+            $channelType |= 2;
+            $reliability = $channel->getMaxPacketLifeTime();
+        }
+
+        $data = pack("CCnNnn", SctpConstant::DATA_CHANNEL_OPEN, $channelType, $priority, $reliability, \strlen($channel->getLabel()), \strlen($channel->getProtocol()));
+        $data .= $channel->getLabel();
+        $data .= $channel->getProtocol();
+        $this->dataChannelQueue->enqueue([$channel, SctpConstant::WEBRTC_DCEP, $data]);
+        // Before the association exists the queued callback cannot send anything, and on the
+        // Windows PHP 8.4 runner it is enough to stall the DTLS handshake that connect() has
+        // also queued. Flush now only once the association is up; setState(ESTABLISHED) flushes
+        // whatever is still queued.
+        if ($this->state === State::ESTABLISHED) {
+            EventLoop::queue(fn () => $this->dataChannelFlush());
+        }
+    }
+
+    /**
+     * Receives a message for a data channel, handling different message types.
+     *
+     * @param int $streamId The ID of the stream.
+     * @param int $ppId The protocol ID.
+     * @param string $data The received data.
+     *
+     * @throws InvalidArgumentException If an invalid stream ID is encountered.
+     */
+    public function dataChannelReceive(int $streamId, int $ppId, string $data): void
+    {
+        if ($ppId === SctpConstant::WEBRTC_DCEP && \strlen($data) > 0) {
+            $msgType = \ord($data[0]);
+            if ($msgType === SctpConstant::DATA_CHANNEL_OPEN && \strlen($data) >= 12) {
+                // Assert no existing channel for this stream ID
+                if (isset($this->dataChannels[$streamId])) {
+                    throw new InvalidArgumentException("Data channel with stream ID $streamId already exists");
+                }
+
+                $unpacked = unpack("CmsgType/CchannelType/npriority/Nreliability/nlabelLength/nprotocolLength", $data);
+                if ($unpacked === false) {
+                    throw new InvalidArgumentException("Failed to unpack data channel open message");
+                }
+                $pos = 12;
+                $labelLength = (int) $unpacked["labelLength"];
+                $protocolLength = (int) $unpacked["protocolLength"];
+                $label = substr($data, $pos, $labelLength);
+
+                $pos += $labelLength;
+                $protocol = substr($data, $pos, $protocolLength);
+
+                // Determine reliability settings
+                $maxPacketLifeTime = null;
+                $maxRetransmits = null;
+                $channelType = (int) $unpacked["channelType"];
+                if (($channelType & 0x03) === 1) {
+                    $maxRetransmits = (int) $unpacked["reliability"];
+                } elseif (($channelType & 0x03) === 2) {
+                    $maxPacketLifeTime = (int) $unpacked["reliability"];
+                }
+
+                // Register the channel
+                $parameters = new RTCDataChannelParameters(
+                    label: $label,
+                    maxPacketLifeTime: $maxPacketLifeTime,
+                    maxRetransmits: $maxRetransmits,
+                    ordered: ($channelType & 0x80) === 0,
+                    protocol: $protocol,
+                    id: $streamId
+                );
+                $channel = new RTCDataChannel($this, $parameters, false);
+                $channel->setReadyState(DataChannelState::Open);
+                $this->dataChannels[$streamId] = $channel;
+
+                // Send ACK
+                $this->dataChannelQueue->enqueue([
+                    $channel,
+                    SctpConstant::WEBRTC_DCEP,
+                    pack("C", SctpConstant::DATA_CHANNEL_ACK),
+                ]);
+
+                EventLoop::queue(fn () => $this->dataChannelFlush());
+
+                // Notify listeners (the peer connection) of the new channel.
+                $this->notifyDataChannel($channel);
+            } elseif ($msgType === SctpConstant::DATA_CHANNEL_ACK) {
+                if (!isset($this->dataChannels[$streamId])) {
+                    throw new InvalidArgumentException("Data channel with stream ID $streamId does not exist");
+                }
+                $channel = $this->dataChannels[$streamId];
+                $channel->setReadyState(DataChannelState::Open);
+            }
+        } elseif ($ppId === SctpConstant::WEBRTC_STRING && isset($this->dataChannels[$streamId])) {
+            // Deliver message for string data
+            $this->dataChannels[$streamId]->dispatchMessage($data);
+        } elseif ($ppId === SctpConstant::WEBRTC_STRING_EMPTY && isset($this->dataChannels[$streamId])) {
+            // Deliver empty string message
+            $this->dataChannels[$streamId]->dispatchMessage("");
+        } elseif ($ppId === SctpConstant::WEBRTC_BINARY && isset($this->dataChannels[$streamId])) {
+            // Deliver binary message
+            $this->dataChannels[$streamId]->dispatchMessage($data);
+        } elseif ($ppId === SctpConstant::WEBRTC_BINARY_EMPTY && isset($this->dataChannels[$streamId])) {
+            // Deliver empty binary message
+            $this->dataChannels[$streamId]->dispatchMessage("");
+        }
+    }
+
+    /**
+     * Sends data over a specified data channel.
+     *
+     * @param RTCDataChannel $channel The channel to send data over.
+     * @param string $data The data to send.
+     */
+    public function dataChannelSend(RTCDataChannel $channel, string $data): void
+    {
+        if ($data === "") {
+            $ppId = SctpConstant::WEBRTC_STRING_EMPTY;
+            $userData = "\x00";
+        } elseif (mb_check_encoding($data, 'UTF-8')) {
+            $ppId = SctpConstant::WEBRTC_STRING;
+            $converted = mb_convert_encoding($data, 'UTF-8', 'ISO-8859-1');
+            if ($converted === false) {
+                throw new RuntimeException("Failed to convert data channel payload to UTF-8");
+            }
+            $userData = $converted;
+        } elseif ($data === "\x00") {
+            $ppId = SctpConstant::WEBRTC_BINARY_EMPTY;
+            $userData = "\x00";
+        } else {
+            $ppId = SctpConstant::WEBRTC_BINARY;
+            $userData = $data;
+        }
+
+        $channel->addBufferedAmount(\strlen($userData));
+        $this->dataChannelQueue->enqueue([$channel, $ppId, $userData]);
+        $this->dataChannelFlush();
+    }
+
+    /**
+     * Update the RTO given a new round-trip measurement.
+     *
+     * @param float $rtt The round-trip time.
+     */
+    public function updateRto(float $rtt): void
+    {
+        if ($this->srtt === null) {
+            $this->rttvar = $rtt / 2.0;
+            $this->srtt = $rtt;
+        } else {
+            if ($this->rttvar === null) {
+                $this->rttvar = $rtt / 2.0;
+            }
+            $this->rttvar = (1.0 - (float)SctpConstant::SCTP_RTO_BETA) * $this->rttvar + (float)SctpConstant::SCTP_RTO_BETA * abs($this->srtt - $rtt);
+            $this->srtt = (1.0 - (float)SctpConstant::SCTP_RTO_ALPHA) * $this->srtt + (float)SctpConstant::SCTP_RTO_ALPHA * $rtt;
+        }
+        $this->rto = max(SctpConstant::SCTP_RTO_MIN, min($this->srtt + 4.0 * $this->rttvar, SctpConstant::SCTP_RTO_MAX));
+    }
+}

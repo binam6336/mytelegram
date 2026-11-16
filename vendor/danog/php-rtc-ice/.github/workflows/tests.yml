@@ -1,0 +1,112 @@
+name: ICE TESTS
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        php: ["8.2", "8.3", "8.4", "8.5"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP ${{ matrix.php }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          tools: composer:v2
+          extensions: sockets
+
+      - name: Validate composer.json and composer.lock
+        run: composer validate
+
+      - name: Cache Composer packages
+        id: composer-cache
+        uses: actions/cache@v3
+        with:
+          path: vendor
+          key: ${{ runner.os }}-php-${{ matrix.php }}-${{ hashFiles('**/composer.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-php-
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-progress
+
+      - name: Configure Linux network (multicast, IPv6, rp_filter)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo ip link set lo multicast on
+          sudo sysctl -w net.ipv4.conf.all.rp_filter=0
+          sudo sysctl -w net.ipv4.conf.default.rp_filter=0
+          sudo sysctl -w net.ipv4.conf.lo.rp_filter=0
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0
+          # Unique-local on loopback so ICE can gather a non-::1 IPv6 host candidate.
+          sudo ip -6 addr add fd00:1:2:3::1/128 dev lo || true
+          # Dummy NIC with multicast so group traffic is delivered locally
+          # (loopback has no MULTICAST flag on GitHub-hosted Ubuntu).
+          sudo ip link add mdns0 type dummy
+          sudo ip link set mdns0 up multicast on
+          sudo ip addr add 172.31.255.1/24 dev mdns0
+          sudo ip route replace 224.0.0.0/4 dev mdns0
+          sudo sysctl -w net.ipv4.conf.mdns0.rp_filter=0
+          sudo sysctl -w net.ipv4.conf.mdns0.mc_forwarding=1 || true
+
+      - name: Configure macOS network (multicast, IPv6, firewall)
+        if: matrix.os == 'macos-latest'
+        run: |
+          sudo ifconfig lo0 multicast || true
+          sudo route -n add -net 224.0.0.0/4 -interface lo0 || true
+          sudo ifconfig lo0 inet6 fd00:1:2:3::1/128 alias || true
+          sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate off || true
+
+      - name: Configure Windows network (firewall, weak host, IPv6)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Host-candidate sockets bind a LAN address. The public-profile firewall
+          # drops hairpin UDP to that address (STUN/TURN / mDNS / ICE checks), which
+          # Linux does not. Disable it so the same-interface path works.
+          Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
+          Get-NetFirewallProfile | Format-Table Name, Enabled
+          Get-NetIPInterface | ForEach-Object {
+            Set-NetIPInterface -InterfaceIndex $_.InterfaceIndex `
+              -WeakHostSend Enabled -WeakHostReceive Enabled -ErrorAction SilentlyContinue
+          }
+          netsh interface ipv6 add address "Loopback Pseudo-Interface 1" fd00:1:2:3::1
+          netsh interface ipv6 show address
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: tests/turnserver/go.sum
+
+      - name: Build the pion/turn test server
+        shell: bash
+        run: |
+          # The suite spawns this single-UDP-socket STUN/TURN server on every platform, in place
+          # of coturn (whose Windows cygwin build cannot bind its per-CPU SO_REUSEPORT UDP
+          # listeners). PHP_RTC_TURN_BINARY tells the suite to use this prebuilt binary.
+          bin="$RUNNER_TEMP/php-rtc-turnserver"
+          [ "$RUNNER_OS" = "Windows" ] && bin="${bin}.exe"
+          ( cd tests/turnserver && go build -o "$bin" . )
+          echo "PHP_RTC_TURN_BINARY=$bin" >> "$GITHUB_ENV"
+
+      - name: Run Psalm
+        run: vendor/bin/psalm --no-progress
+
+      - name: Run PHPUnit tests
+        run: vendor/bin/phpunit
+        shell: bash

@@ -1,6 +1,6 @@
 # تله‌پنل — مدیریت پیام‌های تلگرام (Laravel)
 
-پنل فارسی (راست‌به‌چپ) با لاراول ۱۳ و معماری MVC که به **کلاینت تلگرامِ خود کاربر** (حساب شخصی، نه ربات) وصل می‌شود،
+پنل فارسی (راست‌به‌چپ) با لاراول ۱۲ و معماری MVC که به **کلاینت تلگرامِ خود کاربر** (حساب شخصی، نه ربات) وصل می‌شود،
 پیام‌های رسیده را ذخیره می‌کند، با کلیدواژه فیلتر می‌کند و برای اجرا روی **هاست اشتراکی** طراحی شده است.
 
 ## قابلیت‌ها
@@ -29,11 +29,12 @@
    - **وقتی پنل باز است** مرورگر هر ۳۰ ثانیه `POST /telegram/sync` می‌زند (حداکثر ۲۰ ثانیه، با قفل هر حساب).
 
 ## نصب روی هاست اشتراکی (cPanel/DirectAdmin)
-پیش‌نیاز: PHP **8.3+** (CLI و وب) با `pdo_mysql`، `mbstring`، `openssl`، `fileinfo`، `xml`، `json`، `zlib`؛ MySQL/MariaDB؛
+پیش‌نیاز: PHP **8.2+** (CLI و وب) با `pdo_mysql`، `mbstring`، `openssl`، `fileinfo`، `xml`، `json`، `zlib`؛ MySQL/MariaDB؛
 امکان کران‌جاب؛ برای حالت پیش‌فرض، `proc_open` فعال (اگر نبود `TELEGRAM_MODE=inline`). هاست باید به سرورهای تلگرام دسترسی داشته باشد
 (هاست‌های داخل ایران معمولاً ندارند؛ هاست خارج از ایران لازم است).
 
-1. روی سیستم خودتان: `composer install --no-dev --optimize-autoloader` و کل پوشه (به‌همراه `vendor`) را آپلود کنید.
+1. پوشه‌ی `vendor` (بدون پکیج‌های توسعه) داخل مخزن است؛ کافی است کل پروژه را آپلود کنید. Composer لازم نیست.
+   اگر وابستگی‌ها را عوض کردید: `composer update --no-dev` و دوباره کامیت `vendor` (`config.platform.php` روی 8.2.12 قفل است).
 2. Document Root دامنه را روی پوشه‌ی `public` بگذارید. اگر ممکن نیست، فایل `.htaccess` ریشه‌ی پروژه درخواست‌ها را به `public/` می‌فرستد.
 3. `cp .env.example .env`، مقادیر `APP_URL` و `DB_*` را پر کنید، `APP_DEBUG=false` و `APP_ENV=production`، سپس:
    ```
@@ -86,6 +87,6 @@ public/css/app.css, public/js/app.js   بدون مرحله‌ی build
 ## توسعه‌ی محلی
 ```
 cp .env.example .env   # DB_CONNECTION=sqlite و TELEGRAM_FAKE=true برای تست بدون تلگرام
-composer install && php artisan key:generate && php artisan migrate
+php artisan key:generate && php artisan migrate   # vendor در مخزن هست؛ برای ابزارهای توسعه: composer install
 php artisan serve
 ```

@@ -1,0 +1,1781 @@
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Files module.
+ *
+ * This file is part of MadelineProto.
+ * MadelineProto is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+ * MadelineProto is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU Affero General Public License for more details.
+ * You should have received a copy of the GNU General Public License along with MadelineProto.
+ * If not, see <http://www.gnu.org/licenses/>.
+ *
+ * @author    Daniil Gentili <daniil@daniil.it>
+ * @copyright 2016-2025 Daniil Gentili <daniil@daniil.it>
+ * @license   https://opensource.org/licenses/AGPL-3.0 AGPLv3
+ * @link https://docs.madelineproto.xyz MadelineProto documentation
+ */
+
+namespace danog\MadelineProto\MTProtoTools;
+
+use Amp\ByteStream\ReadableStream;
+use Amp\Cancellation;
+use Amp\DeferredFuture;
+use Amp\Future;
+use Amp\Http\Client\Request;
+use Amp\Ipc\Sync\ChannelException;
+use AssertionError;
+use danog\Decoder\FileId;
+use danog\Decoder\FileIdType;
+use danog\MadelineProto\BotApiFileId;
+use danog\MadelineProto\EventHandler\Media;
+use danog\MadelineProto\EventHandler\Media\AnimatedSticker;
+use danog\MadelineProto\EventHandler\Media\Audio;
+use danog\MadelineProto\EventHandler\Media\CustomEmoji;
+use danog\MadelineProto\EventHandler\Media\Document;
+use danog\MadelineProto\EventHandler\Media\DocumentPhoto;
+use danog\MadelineProto\EventHandler\Media\Gif;
+use danog\MadelineProto\EventHandler\Media\InlineThumbnail;
+use danog\MadelineProto\EventHandler\Media\MaskSticker;
+use danog\MadelineProto\EventHandler\Media\Photo;
+use danog\MadelineProto\EventHandler\Media\RoundVideo;
+use danog\MadelineProto\EventHandler\Media\StaticSticker;
+use danog\MadelineProto\EventHandler\Media\Video;
+use danog\MadelineProto\EventHandler\Media\VideoSticker;
+use danog\MadelineProto\EventHandler\Media\Voice;
+use danog\MadelineProto\EventHandler\Message;
+use danog\MadelineProto\Exception;
+use danog\MadelineProto\FileCallbackInterface;
+use danog\MadelineProto\FileRedirect;
+use danog\MadelineProto\Logger;
+use danog\MadelineProto\MTProto\SpecialMethodType;
+use danog\MadelineProto\MTProtoTools\Crypt\IGE;
+use danog\MadelineProto\RPCError\FileTokenInvalidError;
+use danog\MadelineProto\RPCError\FloodPremiumWaitError;
+use danog\MadelineProto\RPCError\FloodWaitError;
+use danog\MadelineProto\RPCError\RequestTokenInvalidError;
+use danog\MadelineProto\SecurityException;
+use danog\MadelineProto\Settings;
+use danog\MadelineProto\StreamEof;
+use danog\MadelineProto\Tools;
+use danog\MadelineProto\UploadResumeException;
+use danog\MadelineProto\WrappedFuture;
+use Revolt\EventLoop;
+use Throwable;
+use Webmozart\Assert\Assert;
+
+use const LOCK_EX;
+use function Amp\async;
+use function Amp\File\deleteFile;
+use function Amp\File\getSize;
+use function Amp\File\openFile;
+use function Amp\Future\await;
+use function Amp\Future\awaitFirst;
+
+/**
+ * Manages upload and download of files.
+ *
+ * @property Settings $settings Settings
+ *
+ * @internal
+ */
+trait Files
+{
+    use FilesLogic;
+    use FileServer;
+    /**
+     * Wrap a media constructor into an abstract Media object.
+     */
+    public function wrapMedia(array $media, bool $protected = false): ?Media
+    {
+        if ($media['_'] === 'photo') {
+            $media = [ '_' => 'messageMediaPhoto', 'photo' => $media ];
+        }
+        if ($media['_'] === 'document') {
+            $media = [ '_' => 'messageMediaDocument', 'document' => $media];
+        }
+        if ($media['_'] === 'decryptedMessageMediaAudio') {
+            return new Audio($this, $media, $media, $protected);
+        }
+        if ($media['_'] === 'decryptedMessageMediaPhoto') {
+            return new Photo($this, $media, $protected);
+        }
+        if ($media['_'] === 'decryptedMessageMediaVideo') {
+            return new Video($this, $media, $media, $protected);
+        }
+        if ($media['_'] === 'messageMediaPhoto') {
+            if (!isset($media['photo']) || $media['photo']['_'] === 'photoEmpty') {
+                return null;
+            }
+            return new Photo($this, $media, $protected);
+        }
+        if ($media['_'] === 'decryptedMessageMediaDocument'
+            || $media['_'] === 'decryptedMessageMediaExternalDocument'
+        ) {
+            // TODO caption?
+            $media = [
+                '_' => 'messageMediaDocument',
+                'document' => $media,
+                'ttl_seconds' => $media['ttl_seconds'],
+                'secret' => true,
+            ];
+        }
+        if ($media['_'] !== 'messageMediaDocument') {
+            return null;
+        }
+        if (!isset($media['document'])) {
+            return null;
+        }
+        $has_video = null;
+        $has_document_photo = null;
+        $has_animated = false;
+        foreach ($media['document']['attributes'] as $attr) {
+            $t = $attr['_'];
+            if ($t === 'documentAttributeImageSize') {
+                $has_document_photo = $attr;
+                continue;
+            }
+            if ($t === 'documentAttributeAnimated') {
+                $has_animated = true;
+                continue;
+            }
+            if ($t === 'documentAttributeSticker') {
+                if ($has_video) {
+                    return new VideoSticker($this, $media, $attr, $has_video, $protected);
+                }
+
+                if ($has_document_photo === null) {
+                    $has_document_photo = [
+                        'w' => null,
+                        'h' => null,
+                    ];
+                }
+
+                if ($attr['mask'] ?? false) {
+                    return new MaskSticker($this, $media, $attr, $has_document_photo, $protected);
+                }
+
+                if ($media['document']['mime_type'] === 'application/x-tgsticker') {
+                    return new AnimatedSticker($this, $media, $attr, $has_document_photo, $protected);
+                }
+
+                return new StaticSticker($this, $media, $attr, $has_document_photo, $protected);
+            }
+            if ($t === 'documentAttributeVideo') {
+                $has_video = $attr;
+                continue;
+            }
+            if ($t === 'documentAttributeAudio') {
+                // Round videos may also have an audio attribute, with the waveform.
+                foreach ($media['document']['attributes'] as $video) {
+                    if ($video['_'] === 'documentAttributeVideo' && ($video['round_message'] ?? false)) {
+                        continue 2;
+                    }
+                }
+                return $attr['voice']
+                    ? new Voice($this, $media, $attr, $protected)
+                    : new Audio($this, $media, $attr, $protected);
+            }
+            if ($t === 'documentAttributeCustomEmoji') {
+                if ($has_document_photo === null) {
+                    throw new AssertionError("has_document_photo === null: ".json_encode($media['document']));
+                }
+                return new CustomEmoji($this, $media, $attr, $has_document_photo, $protected);
+            }
+        }
+        if ($has_animated) {
+            if ($has_video === null) {
+                return new Document($this, $media, $protected);
+            }
+            return new Gif($this, $media, $has_video, $protected);
+        }
+        if ($has_video) {
+            return ($has_video['round_message'] ?? false)
+                ? new RoundVideo($this, $media, $has_video, $protected)
+                : new Video($this, $media, $has_video, $protected);
+        }
+        if ($has_document_photo) {
+            return new DocumentPhoto($this, $media, $has_document_photo, $protected);
+        }
+        return new Document($this, $media, $protected);
+    }
+    /**
+     * Upload file from URL.
+     *
+     * @param  string|FileCallbackInterface $url       URL of file
+     * @param  integer                      $size      Size of file
+     * @param  string                       $fileName  File name
+     * @param  callable                     $cb        Callback
+     * @param  boolean                      $encrypted Whether to encrypt file for secret chats
+     * @return array                        InputFile constructor
+     */
+    public function uploadFromUrl(string|FileCallbackInterface $url, int $size = 0, string $fileName = '', ?callable $cb = null, bool $encrypted = false, ?Cancellation $cancellation = null): array
+    {
+        if (\is_object($url) && $url instanceof FileCallbackInterface) {
+            $cb = $url;
+            $url = $url->getFile();
+        }
+        $request = new Request($url);
+        $request->setTransferTimeout(INF);
+        $request->setInactivityTimeout(INF);
+        $request->setBodySizeLimit(512 * 1024 * 8000);
+        $response = $this->datacenter->getHTTPClient()->request($request, $cancellation);
+        if (($status = $response->getStatus()) !== 200) {
+            throw new Exception("Wrong status code: {$status} ".$response->getReason());
+        }
+        $mime = trim(explode(';', $response->getHeader('content-type') ?? '')[0]) ?: null;
+        $size = (int) ($response->getHeader('content-length') ?? $size);
+        $stream = $response->getBody();
+        // An interrupted upload can only be resumed if we can tell that the file did not change since.
+        $validator = $response->getHeader('etag') ?? $response->getHeader('last-modified');
+        $resumeKey = $validator !== null ? 'url:'.$url."\0".$validator : null;
+        $reopenAt = null;
+        if ($validator !== null && strtolower($response->getHeader('accept-ranges') ?? '') === 'bytes') {
+            $reopenAt = function (int $offset) use ($url, $validator, $cancellation): ?ReadableStream {
+                $request = new Request($url);
+                $request->setTransferTimeout(INF);
+                $request->setInactivityTimeout(INF);
+                $request->setBodySizeLimit(512 * 1024 * 8000);
+                $request->setHeader('Range', "bytes=$offset-");
+                $request->setHeader('If-Range', $validator);
+                $response = $this->datacenter->getHTTPClient()->request($request, $cancellation);
+                if ($response->getStatus() !== 206
+                    || !str_starts_with($response->getHeader('content-range') ?? '', "bytes $offset-")
+                ) {
+                    // The range was ignored (for example, because the file changed).
+                    $response->getBody()->close();
+                    return null;
+                }
+                return $response->getBody();
+            };
+        }
+        return $this->uploadFromStreamInternal($stream, $size, $mime, $fileName, $cb, $encrypted, $cancellation, $resumeKey, $reopenAt);
+    }
+    /**
+     * Upload file from callable.
+     *
+     * The callable must accept two parameters: int $offset, int $size
+     * The callable must return a string with the contest of the file at the specified offset and size.
+     *
+     * @param (callable(int, int, ?Cancellation): string) $callable  Callable (offset, length) => data
+     * @param integer                                   $size      File size
+     * @param ?string                                    $mime      Mime type
+     * @param string                                    $fileName  File name
+     * @param (callable(float, float, float): void)       $cb        Status callback
+     * @param boolean                                   $seekable  Whether chunks can be fetched out of order
+     * @param boolean                                   $encrypted Whether to encrypt file for secret chats
+     *
+     * @return array InputFile constructor
+     */
+    public function uploadFromCallable(callable $callable, int $size = 0, ?string $mime = null, string $fileName = '', ?callable $cb = null, bool $seekable = true, bool $encrypted = false, ?Cancellation $cancellation = null): array
+    {
+        return $this->uploadFromCallableInternal($callable, $size, $mime, $fileName, $cb, $seekable, $encrypted, $cancellation);
+    }
+    /**
+     * Upload file from callable, resuming an interrupted upload of the same file if possible.
+     *
+     * @param ?string $resumeKey Identifies the source of the file across restarts: if an upload of the same file
+     *                           (with the same size) was interrupted, it is resumed.
+     *                           A non-seekable callable must then accept starting from a non-zero offset (the first missing part).
+     */
+    private function uploadFromCallableInternal(callable $callable, int $size = 0, ?string $mime = null, string $fileName = '', ?callable $cb = null, bool $seekable = true, bool $encrypted = false, ?Cancellation $cancellation = null, ?string $resumeKey = null): array
+    {
+        if ($cb === null) {
+            $cb = function (float $percent, float $speed, float $time): void {
+                $this->logger->logger('Upload status: '.$percent.'%', Logger::NOTICE);
+            };
+        } else {
+            $cb = static function (float $percent, float $speed, float $time) use ($cb): void {
+                EventLoop::queue(static function () use ($percent, $speed, $time, $cb): void {
+                    try {
+                        $cb($percent, $speed, $time);
+                    } catch (ChannelException) {
+                        // The IPC client this progress was meant for is gone.
+                    }
+                });
+            };
+        }
+        $part_size = 512 * 1024;
+        if (!$size) {
+            $seekable = false;
+        }
+        $datacenter = $this->loginState->getState()->authorizedDc;
+        if ($this->datacenter->has(-$datacenter)) {
+            $datacenter = -$datacenter;
+        }
+        $parallel_chunks = $this->settings->getFiles()->getUploadParallelChunks();
+        $part_total_num = $size ? ((int) ceil($size / $part_size)) : -1;
+        Assert::notEq($part_total_num, 0);
+        $part_num = 0;
+        $method = $size > 10 * 1024 * 1024 || !$size ? 'upload.saveBigFilePart' : 'upload.saveFilePart';
+        $constructor = 'input'.($encrypted === true ? 'Encrypted' : '').($size > 10 * 1024 * 1024 || !$size ? 'FileBig' : 'File').($encrypted === true ? 'Uploaded' : '');
+        $stateKey = $this->getUploadStateKey($resumeKey, $size, $encrypted);
+        $state = $stateKey !== null ? $this->resumableUploads[$stateKey] ?? null : null;
+        if ($state !== null && $state['part_size'] !== $part_size) {
+            $state = null;
+        }
+        $file_id = $state['file_id'] ?? Tools::random(8);
+        $ige = null;
+        $fingerprint = null;
+        $iv = null;
+        $key = null;
+        if ($encrypted === true) {
+            $key = $state['key'] ?? Tools::random(32);
+            $iv = $state['iv'] ?? Tools::random(32);
+            $digest = Crypt::md5($key.$iv);
+            $fingerprint = Tools::unpackSignedInt(substr($digest, 0, 4) ^ substr($digest, 4, 4));
+            // IGE is chained: resume encrypting from the last saved point.
+            $ige = IGE::getInstance($key, $state['ige_state'] ?? $iv);
+            $seekable = false;
+        }
+        /** @var array<int, true> The parts uploaded before the upload was interrupted. */
+        $uploaded = $state['parts'] ?? [];
+        if (!$seekable) {
+            // Sequential sources restart from the first missing part,
+            // or from the last point where the encryption state was saved.
+            if ($encrypted) {
+                $part_num = $state['ige_part'] ?? 0;
+            } else {
+                while (isset($uploaded[$part_num])) {
+                    $part_num++;
+                }
+            }
+        }
+        if ($stateKey !== null) {
+            if ($state !== null) {
+                $this->logger->logger('Resuming upload of '.($fileName ?: 'file').': '.\count($uploaded)." of $part_total_num parts were already uploaded", Logger::NOTICE);
+            }
+            $this->resumableUploads[$stateKey] = $state ?? [
+                'file_id' => $file_id,
+                'part_size' => $part_size,
+                'parts' => [],
+                'time' => time(),
+            ] + ($encrypted ? [
+                'key' => $key,
+                'iv' => $iv,
+                'ige_part' => 0,
+                'ige_state' => $iv,
+            ] : []);
+            $this->activeUploads[$stateKey] = true;
+        }
+        /** @var array<int, string> Encryption state after each part, until it is saved in the resume state. */
+        $igeStates = [];
+        //$ctx = \hash_init('md5');
+        $promises = [];
+        // Without a size, the progress is unknown until the upload ends.
+        $progress = $size ? new TransferProgress($cb, $part_total_num) : null;
+        // Parts before the first one we read were already uploaded.
+        $totalSize = min($part_num * $part_size, $size);
+        if ($progress) {
+            for ($x = 0; $x < $part_num; $x++) {
+                $progress->partDone(0);
+            }
+        }
+        if (!$seekable) {
+            $nextOffset = $part_num * $part_size;
+            $callable = static function (int $offset, int $size, ?Cancellation $cancellation) use ($callable, &$nextOffset): string {
+                Assert::eq($offset, $nextOffset);
+                $nextOffset += $size;
+                return $callable($offset, $size, $cancellation);
+            };
+        }
+        $read = $callable;
+        $callable = static function (int $part_num) use (&$totalSize, $size, $file_id, &$part_total_num, $part_size, $read, $ige, &$igeStates, $cancellation): array {
+            $bytes = $read(
+                $part_num * $part_size,
+                $part_size,
+                $cancellation,
+            );
+            $cancellation?->throwIfRequested();
+            $totalSize += $bytesLen = \strlen($bytes);
+            if ($size === 0) {
+                if ($bytesLen === 0) {
+                    throw new StreamEof();
+                }
+                if ($bytesLen < $part_size) {
+                    $part_total_num = (int) ceil($totalSize / $part_size);
+                }
+            }
+
+            if ($ige) {
+                $bytes = $ige->encrypt(str_pad($bytes, $part_size, \chr(0)));
+                $igeStates[$part_num + 1] = $ige->getState();
+            }
+
+            return ['file_id' => $file_id, 'file_part' => $part_num, 'file_total_parts' => $part_total_num, 'bytes' => $bytes];
+        };
+        $resPromises = [];
+        $start = hrtime(true);
+        /** @var ?FloodPremiumWaitError */
+        $floodWaitError = null;
+        try {
+            while ($part_num < $part_total_num || !$size) {
+                if ($seekable && isset($uploaded[$part_num])) {
+                    $totalSize += min($part_size, $size - $part_num * $part_size);
+                    $progress?->partDone(0);
+                    ++$part_num;
+                    continue;
+                }
+                if ($seekable) {
+                    $writeCb = function () use ($method, $callable, $part_num, $cancellation, &$datacenter, &$floodWaitError): WrappedFuture {
+                        $floodWaitError?->wait($cancellation);
+                        return $this->methodCallAsyncWrite(
+                            $method,
+                            $callable($part_num) + ['cancellation' => $cancellation, 'floodWaitLimit' => 0, 'specialMethodType' => SpecialMethodType::FILE_RELATED],
+                            $datacenter
+                        );
+                    };
+                } else {
+                    try {
+                        $part = $callable($part_num) + ['cancellation' => $cancellation, 'floodWaitLimit' => 0, 'specialMethodType' => SpecialMethodType::FILE_RELATED];
+                    } catch (StreamEof) {
+                        break;
+                    }
+                    if (isset($uploaded[$part_num])) {
+                        // Only read (and encrypted) to get to the next part.
+                        $progress?->partDone(0);
+                        ++$part_num;
+                        continue;
+                    }
+                    $writeCb = function () use ($method, $part, &$datacenter, &$floodWaitError, $cancellation): WrappedFuture {
+                        $floodWaitError?->wait($cancellation);
+                        return $this->methodCallAsyncWrite(
+                            $method,
+                            $part,
+                            $datacenter
+                        );
+                    };
+                }
+                // Ignored: if the upload fails or is cancelled, the caller stops before awaiting it.
+                $writePromise = async($writeCb)->ignore();
+                EventLoop::queue(function () use ($writePromise, $progress, $part_num, $part_size, $size, &$resPromises, $cancellation, $writeCb, &$datacenter, &$floodWaitError, $stateKey, &$igeStates): void {
+                    $d = new DeferredFuture;
+                    // Ignored: if the upload fails or is cancelled, the caller stops before awaiting it.
+                    $resPromises[] = $d->getFuture()->ignore();
+                    try {
+                        do {
+                            $readFuture = $writePromise->await($cancellation);
+                            try {
+                                // Wrote chunk!
+                                if (!$readFuture->await($cancellation)) {
+                                    throw new Exception('Upload of part '.$part_num.' failed');
+                                }
+                                // Got OK from server for chunk!
+                                if ($stateKey !== null) {
+                                    $this->markPartUploaded($stateKey, $part_num, $igeStates);
+                                }
+                                $progress?->partDone(min($part_size, $size - $part_num * $part_size));
+                                $d->complete();
+                                return;
+                            } catch (FloodWaitError $e) {
+                                $this->datacenter->getDataCenterConnection($datacenter)->waitAfterFileFlood($e, $cancellation);
+                                $writePromise = async($writeCb);
+                            } catch (FloodPremiumWaitError $e) {
+                                $this->logger("Got {$e->rpc} while uploading part $part_num: {$datacenter}, waiting and retrying...");
+                                $floodWaitError = $e;
+                                $writePromise = async($writeCb);
+                            } catch (FileRedirect $e) {
+                                $datacenter = $e->dc;
+                                $this->logger("Got redirect while uploading part $part_num: {$datacenter}");
+                                $writePromise = async($writeCb);
+                            } catch (Throwable $e) {
+                                $cancellation?->throwIfRequested();
+                                $this->logger("Got exception while uploading part $part_num: {$e}");
+                                $writePromise = async($writeCb);
+                            }
+                        } while (true);
+                    } catch (Throwable $e) {
+                        // Hand the error (e.g. a cancellation) to the caller, instead of the event loop.
+                        $d->error($e);
+                    }
+                });
+                $promises[] = $writePromise;
+                ++$part_num;
+                if (\count($promises) === $parallel_chunks) {
+                    // By default, 10 mb at a time, for a typical bandwidth of 1gbps (run the code in this every second)
+                    awaitFirst($promises, $cancellation);
+                    foreach ($promises as $k => $p) {
+                        if ($p->isComplete()) {
+                            unset($promises[$k]);
+                            break;
+                        }
+                    }
+                }
+            }
+            await($promises, $cancellation);
+            await($resPromises, $cancellation);
+            if ($stateKey !== null) {
+                unset($this->resumableUploads[$stateKey]);
+            }
+        } catch (UploadResumeException $e) {
+            // Resuming again would fail the same way: the next upload of this file starts from scratch.
+            if ($stateKey !== null) {
+                unset($this->resumableUploads[$stateKey]);
+            }
+            throw $e;
+        } finally {
+            if ($stateKey !== null) {
+                unset($this->activeUploads[$stateKey]);
+            }
+        }
+        if ($totalSize === 0) {
+            throw new AssertionError('You uploaded an empty file!');
+        }
+        $time = (hrtime(true) - $start) / 1e9;
+        $speed = (int) ($totalSize * 8 / $time) / 1000000;
+        if (!$size) {
+            $cb(100, $speed, $time);
+        }
+        $this->logger->logger("Total upload time: {$time}");
+        $this->logger->logger("Total upload speed: {$speed} mbps");
+        $constructor = ['_' => $constructor, 'id' => $file_id, 'parts' => $part_total_num, 'name' => $fileName, 'mime_type' => $mime ?? 'application/octet-stream'];
+        if ($encrypted === true) {
+            $constructor['key_fingerprint'] = $fingerprint;
+            $constructor['key'] = $key;
+            $constructor['iv'] = $iv;
+            $constructor['size'] = $totalSize;
+        }
+        $constructor['md5_checksum'] = '';
+        //\hash_final($ctx);
+        return $constructor;
+    }
+    /**
+     * For how long the state of an interrupted upload is kept, in seconds.
+     *
+     * Telegram only keeps uploaded parts for a limited time.
+     */
+    private const UPLOAD_RESUME_TTL = 3600;
+
+    /**
+     * State of interrupted uploads, to resume them.
+     *
+     * @var array<string, array{file_id: string, part_size: int, parts: array<int, true>, time: int, key?: string, iv?: string, ige_part?: int, ige_state?: string}>
+     */
+    private array $resumableUploads = [];
+
+    /**
+     * Key of the MACs of the file IDs of inline thumbnails: they carry the thumbnail itself, so only the ones
+     * generated by this session are accepted (a forged one would make the download script serve anything).
+     */
+    private ?string $inlineFileIdKey = null;
+
+    /**
+     * @internal
+     */
+    public function getInlineFileIdKey(): string
+    {
+        return $this->inlineFileIdKey ??= random_bytes(32);
+    }
+
+    /**
+     * Uploads in progress in this process, by resume state key.
+     *
+     * @var array<string, true>
+     */
+    private array $activeUploads = [];
+
+    /**
+     * Get the key of the resume state of an upload, dropping expired states.
+     *
+     * Returns null if the upload can't be resumed: its source or size is not known, or the same file
+     * is already being uploaded (the two uploads must not share their state).
+     */
+    private function getUploadStateKey(?string $resumeKey, int $size, bool $encrypted): ?string
+    {
+        $expired = time() - self::UPLOAD_RESUME_TTL;
+        foreach ($this->resumableUploads as $key => $state) {
+            if ($state['time'] < $expired && !isset($this->activeUploads[$key])) {
+                unset($this->resumableUploads[$key]);
+            }
+        }
+        if ($resumeKey === null || $size <= 0) {
+            return null;
+        }
+        $key = bin2hex(Crypt::sha256($resumeKey."\0".$size."\0".($encrypted ? 'encrypted' : 'plain')));
+        return isset($this->activeUploads[$key]) ? null : $key;
+    }
+
+    /**
+     * Record that a part was uploaded, saving the encryption state if the uploaded prefix grew.
+     *
+     * @param array<int, string> $igeStates Encryption state after each part
+     */
+    private function markPartUploaded(string $stateKey, int $part, array &$igeStates): void
+    {
+        if (!isset($this->resumableUploads[$stateKey])) {
+            return;
+        }
+        $state = &$this->resumableUploads[$stateKey];
+        $state['parts'][$part] = true;
+        $state['time'] = time();
+        if (!isset($state['ige_part'])) {
+            return;
+        }
+        $prefix = $state['ige_part'];
+        while (isset($state['parts'][$prefix])) {
+            $prefix++;
+        }
+        if ($prefix > $state['ige_part'] && isset($igeStates[$prefix])) {
+            $state['ige_part'] = $prefix;
+            $state['ige_state'] = $igeStates[$prefix];
+            foreach ($igeStates as $k => $_) {
+                if ($k <= $prefix) {
+                    unset($igeStates[$k]);
+                }
+            }
+        }
+    }
+    /**
+     * Get the unique bot API file ID of a Telegram file, which doesn't change with its file reference.
+     *
+     * Returns null for files that aren't downloaded from Telegram.
+     */
+    private function getUniqueBotApiFileId(mixed $media): ?string
+    {
+        if ($media instanceof BotApiFileId) {
+            $media = $media->fileId;
+        }
+        if ($media instanceof Message) {
+            $media = $media->media;
+        }
+        if ($media instanceof Media) {
+            return $media->botApiFileUniqueId;
+        }
+        if (\is_string($media)) {
+            return InlineThumbnail::getUniqueFileId($media, $this->getInlineFileIdKey()) ?? FileId::fromBotAPI($media)->getUniqueBotAPI();
+        }
+        if (!\is_array($media)) {
+            return null;
+        }
+        if (!isset($media['_'])) {
+            $media = self::extractBotAPIFile($media) ?? $media;
+            if (isset($media['file_unique_id'])) {
+                return $media['file_unique_id'];
+            }
+            return isset($media['file_id']) ? FileId::fromBotAPI($media['file_id'])->getUniqueBotAPI() : null;
+        }
+        // The media that is downloaded, as in getDownloadInfo().
+        switch ($media['_']) {
+            case 'updateNewMessage':
+            case 'updateNewChannelMessage':
+            case 'updateEditMessage':
+            case 'updateEditChannelMessage':
+            case 'updateNewEncryptedMessage':
+                return $this->getUniqueBotApiFileId($media['message']);
+            case 'message':
+            case 'storyItem':
+                return $this->getUniqueBotApiFileId($media['media']);
+            case 'encryptedMessage':
+                if ($media['decrypted_message']['media']['_'] !== 'decryptedMessageMediaExternalDocument') {
+                    $media['decrypted_message']['media']['file'] = $media['file'];
+                }
+                return $this->getUniqueBotApiFileId($media['decrypted_message']['media']);
+            case 'wallPaper':
+                return $this->getUniqueBotApiFileId($media['document']);
+            case 'user':
+            case 'channel':
+            case 'chat':
+            case 'updateUserPhoto':
+                return $this->profilePhotoToBotAPI($media)['file_unique_id'];
+            case 'document':
+            case 'decryptedMessageMediaExternalDocument':
+                $media = ['_' => 'messageMediaDocument', 'ttl_seconds' => 0, 'document' => $media];
+                // no break
+            case 'photo':
+            case 'messageMediaPhoto':
+            case 'messageMediaDocument':
+            case 'decryptedMessageMediaPhoto':
+            case 'decryptedMessageMediaVideo':
+            case 'decryptedMessageMediaDocument':
+            case 'decryptedMessageMediaAudio':
+                return self::extractBotAPIFile($this->MTProtoToBotAPI($media))['file_unique_id'] ?? null;
+            default:
+                // Photo sizes are inlined, or downloaded as part of their photo.
+                return null;
+        }
+    }
+    /**
+     * Reupload telegram file.
+     *
+     * @param mixed    $media     Telegram file
+     * @param callable $cb        Callback
+     * @param boolean  $encrypted Whether to encrypt file for secret chats
+     *
+     * @return array InputFile constructor
+     */
+    public function uploadFromTgfile(mixed $media, ?callable $cb = null, bool $encrypted = false, ?Cancellation $cancellation = null): array
+    {
+        if (\is_object($media) && $media instanceof FileCallbackInterface) {
+            $cb = $media;
+            $media = $media->getFile();
+        }
+        $resumeKey = $this->getUniqueBotApiFileId($media);
+        $media = ($this->getDownloadInfo($media));
+        if (!isset($media['size'], $media['mime'])) {
+            throw new Exception('Wrong file provided!');
+        }
+        $size = $media['size'];
+        $mime = $media['mime'];
+        if ($resumeKey !== null) {
+            $resumeKey = 'tgfile:'.$resumeKey.':'.($media['key_fingerprint'] ?? '');
+        }
+        $stateKey = $this->getUploadStateKey($resumeKey, $size, $encrypted);
+        if ($stateKey !== null && isset($this->resumableUploads[$stateKey])) {
+            // Resume an interrupted upload reading the file sequentially, skipping the parts that were already uploaded without downloading them.
+            return $this->uploadFromStreamInternal($this->downloadToReturnedStream($media, cancellation: $cancellation), $size, $mime, '', $cb, $encrypted, $cancellation, $resumeKey);
+        }
+        $chunk_size = 512 * 1024;
+        $bridge = new class($size, $chunk_size, $cb, $cancellation) {
+            /**
+             * Read promises.
+             *
+             * @var array<DeferredFuture>
+             */
+            private array $read = [];
+            /**
+             * Read promises (write lenth).
+             *
+             * @var array<int>
+             */
+            private array $wrote = [];
+            /**
+             * Write promises.
+             *
+             * @var array<DeferredFuture>
+             */
+            private array $write = [];
+            /**
+             * Part size.
+             *
+             */
+            private int $partSize;
+            /**
+             * Offset for callback.
+             *
+             */
+            private int $offset = 0;
+            /**
+             * Callback.
+             *
+             * @var ?callable
+             */
+            private $cb;
+            /**
+             * Constructor.
+             *
+             * @param integer       $size     Total file size
+             * @param integer       $partSize Part size
+             * @param null|callable $cb       Callback
+             */
+            public function __construct(int $size, int $partSize, ?callable $cb, private readonly ?Cancellation $cancellation)
+            {
+                for ($x = 0; $x < $size; $x += $partSize) {
+                    $this->read[] = new DeferredFuture();
+                    $this->write[] = new DeferredFuture();
+                    $this->wrote[] = $size - $x < $partSize ? $size - $x : $partSize;
+                }
+                $this->partSize = $partSize;
+                $this->cb = $cb;
+            }
+            /**
+             * Read chunk.
+             *
+             * @param integer $offset Offset
+             * @param integer $size   Chunk size
+             */
+            public function read(int $offset, int $size): string
+            {
+                $offset /= $this->partSize;
+                return $this->write[$offset]->getFuture()->await($this->cancellation);
+            }
+            /**
+             * Write chunk.
+             *
+             * @param string  $data   Data
+             * @param integer $offset Offset
+             */
+            public function write(string $data, int $offset): void
+            {
+                $offset /= $this->partSize;
+                $this->write[$offset]->complete($data);
+                $this->read[$offset]->getFuture()->await($this->cancellation);
+            }
+            /**
+             * Read callback, called when the chunk is read and fully resent.
+             *
+             * @param mixed ...$params Params to be passed to cb
+             */
+            public function callback(mixed ...$params): mixed
+            {
+                $offset = $this->offset++;
+                $this->read[$offset]->complete($this->wrote[$offset]);
+                if ($this->cb) {
+                    return ($this->cb)(...$params);
+                }
+                return null;
+            }
+        };
+        $reader = $bridge->read(...);
+        $writer = $bridge->write(...);
+        $cb = $bridge->callback(...);
+        $read = async($this->uploadFromCallableInternal(...), $reader, $size, $mime, '', $cb, true, $encrypted, $cancellation, $resumeKey);
+        $write = async($this->downloadToCallable(...), $media, $writer, null, true, 0, -1, $chunk_size, $cancellation);
+        [$res] = await([$read, $write], $cancellation);
+        return $res;
+    }
+
+    private static function inputGeoPoint(array $geo): array
+    {
+        $point = ['_' => 'inputGeoPoint', 'lat' => $geo['lat'], 'long' => $geo['long']];
+        if (isset($geo['accuracy_radius'])) {
+            $point['accuracy_radius'] = $geo['accuracy_radius'];
+        }
+        return $point;
+    }
+
+    private function genAllFile($media)
+    {
+        $res = [$this->TL->getConstructors()->findByPredicate($media['_'])['type'] => $media];
+        switch ($media['_']) {
+            case 'messageMediaPoll':
+                $res['Poll'] = $media['poll'];
+                $res['InputMedia'] = ['_' => 'inputMediaPoll', 'poll' => $res['Poll']];
+                if (isset($res['Poll']['quiz']) && $res['Poll']['quiz']) {
+                    if (empty($media['results']['results'])) {
+                        //quizzes need a correct answer
+                        throw new Exception('No poll results');
+                    }
+                    foreach ($media['results']['results'] as $answer) {
+                        if ($answer['correct']) {
+                            $res['InputMedia']['correct_answers'][] = $answer['option'];
+                        }
+                    }
+                }
+                if (isset($media['results']['solution'])) {
+                    $res['InputMedia']['solution'] = $media['results']['solution'];
+                }
+                if (isset($media['results']['solution_entities'])) {
+                    $res['InputMedia']['solution_entities'] = $media['results']['solution_entities'];
+                }
+                break;
+            case 'updateMessagePoll':
+                $res['Poll'] = $media['poll'];
+                $res['InputMedia'] = ['_' => 'inputMediaPoll', 'poll' => $res['Poll']];
+                $res['MessageMedia'] = ['_' => 'messageMediaPoll', 'poll' => $res['Poll'], 'results' => $media['results']];
+                if (isset($res['Poll']['quiz']) && $res['Poll']['quiz']) {
+                    if (empty($media['results']['results'])) {
+                        //quizzes need a correct answer
+                        throw new Exception('No poll results');
+                    }
+                    foreach ($media['results']['results'] as $answer) {
+                        if ($answer['correct']) {
+                            $res['InputMedia']['correct_answers'][] = $answer['option'];
+                        }
+                    }
+                }
+                if (isset($media['results']['solution'])) {
+                    $res['InputMedia']['solution'] = $media['results']['solution'];
+                }
+                if (isset($media['results']['solution_entities'])) {
+                    $res['InputMedia']['solution_entities'] = $media['results']['solution_entities'];
+                }
+                break;
+            case 'messageMediaPhoto':
+                if (!isset($media['photo']['access_hash'])) {
+                    throw new Exception('No access hash');
+                }
+                $res['Photo'] = $media['photo'];
+                $res['InputPhoto'] = ['_' => 'inputPhoto', 'id' => $media['photo']['id'], 'access_hash' => $media['photo']['access_hash'], 'file_reference' => $this->referenceDatabase->getReference(ReferenceDatabase::PHOTO, $media['photo'])];
+                $res['InputMedia'] = ['_' => 'inputMediaPhoto', 'id' => $res['InputPhoto']];
+                if (isset($media['ttl_seconds'])) {
+                    $res['InputMedia']['ttl_seconds'] = $media['ttl_seconds'];
+                }
+                if (isset($media['spoiler'])) {
+                    $res['InputMedia']['spoiler'] = $media['spoiler'];
+                }
+                break;
+            case 'messageMediaDocument':
+                if (!isset($media['document']['access_hash'])) {
+                    throw new Exception('No access hash');
+                }
+                $res['Document'] = $media['document'];
+                $res['InputDocument'] = ['_' => 'inputDocument', 'id' => $media['document']['id'], 'access_hash' => $media['document']['access_hash'], 'file_reference' => $this->referenceDatabase->getReference(ReferenceDatabase::DOCUMENT, $media['document'])];
+                $res['InputMedia'] = ['_' => 'inputMediaDocument', 'id' => $res['InputDocument']];
+                if (isset($media['ttl_seconds'])) {
+                    $res['InputMedia']['ttl_seconds'] = $media['ttl_seconds'];
+                }
+                break;
+            case 'messageMediaDice':
+                $res['InputMedia'] = ['_' => 'inputMediaDice', 'emoticon' => $media['emoticon']];
+                break;
+            case 'poll':
+                $res['InputMedia'] = ['_' => 'inputMediaPoll', 'poll' => $res['Poll']];
+                break;
+            case 'document':
+                if (!isset($media['access_hash'])) {
+                    throw new Exception('No access hash');
+                }
+                $res['InputDocument'] = ['_' => 'inputDocument', 'id' => $media['id'], 'access_hash' => $media['access_hash'], 'file_reference' => $this->referenceDatabase->getReference(ReferenceDatabase::DOCUMENT, $media)];
+                $res['InputMedia'] = ['_' => 'inputMediaDocument', 'id' => $res['InputDocument']];
+                $res['MessageMedia'] = ['_' => 'messageMediaDocument', 'document' => $media];
+                break;
+            case 'photo':
+                if (!isset($media['access_hash'])) {
+                    throw new Exception('No access hash');
+                }
+                $res['InputPhoto'] = ['_' => 'inputPhoto', 'id' => $media['id'], 'access_hash' => $media['access_hash'], 'file_reference' => $this->referenceDatabase->getReference(ReferenceDatabase::PHOTO, $media)];
+                $res['InputMedia'] = ['_' => 'inputMediaPhoto', 'id' => $res['InputPhoto']];
+                $res['MessageMedia'] = ['_' => 'messageMediaPhoto', 'photo' => $media];
+                break;
+            case 'messageMediaStory':
+                $media['_'] = 'inputMediaStory';
+                $res['InputMedia'] = $media;
+                break;
+            case 'messageMediaWebPage':
+                // The link preview of a text message (webPageNotModified has no URL)
+                if (!isset($media['webpage']['url'])) {
+                    throw new Exception('The link preview has no URL');
+                }
+                $res['InputMedia'] = [
+                    '_' => 'inputMediaWebPage',
+                    'url' => $media['webpage']['url'],
+                    'force_large_media' => $media['force_large_media'] ?? false,
+                    'force_small_media' => $media['force_small_media'] ?? false,
+                    // Don't fail if no preview can be generated (webPageEmpty: there was none)
+                    'optional' => true,
+                ];
+                break;
+            case 'messageMediaGeo':
+                if ($media['geo']['_'] !== 'geoPoint') {
+                    throw new Exception('Empty location');
+                }
+                $res['InputMedia'] = ['_' => 'inputMediaGeoPoint', 'geo_point' => self::inputGeoPoint($media['geo'])];
+                break;
+            case 'messageMediaVenue':
+                if ($media['geo']['_'] !== 'geoPoint') {
+                    throw new Exception('Empty location');
+                }
+                $res['InputMedia'] = [
+                    '_' => 'inputMediaVenue',
+                    'geo_point' => self::inputGeoPoint($media['geo']),
+                    'title' => $media['title'],
+                    'address' => $media['address'],
+                    'provider' => $media['provider'],
+                    'venue_id' => $media['venue_id'],
+                    'venue_type' => $media['venue_type'],
+                ];
+                break;
+            case 'messageMediaContact':
+                $res['InputMedia'] = [
+                    '_' => 'inputMediaContact',
+                    'phone_number' => $media['phone_number'],
+                    'first_name' => $media['first_name'],
+                    'last_name' => $media['last_name'],
+                    'vcard' => $media['vcard'],
+                ];
+                break;
+            default:
+                throw new Exception("Could not convert media object of type {$media['_']}");
+        }
+        return $res;
+    }
+    /**
+     * Get info about file.
+     *
+     * @param mixed $constructor File ID
+     */
+    public function getFileInfo(mixed $constructor): array
+    {
+        if ($constructor instanceof Message) {
+            $constructor = $constructor->media;
+        }
+        if ($constructor instanceof Media) {
+            $constructor = $constructor->botApiFileId;
+        }
+        if (\is_string($constructor)) {
+            $constructor = $this->unpackFileId($constructor);
+            if (isset($constructor['MessageMedia'])) {
+                $constructor = $constructor['MessageMedia'];
+            } elseif (isset($constructor['InputMedia'])) {
+                return $constructor;
+            } elseif (isset($constructor['Chat']) || isset($constructor['User'])) {
+                throw new Exception("Chat photo file IDs can't be reused to resend chat photos, please use getPwrChat()['photo'], instead");
+            }
+        }
+        switch ($constructor['_']) {
+            case 'updateNewMessage':
+            case 'updateNewChannelMessage':
+            case 'updateEditMessage':
+            case 'updateEditChannelMessage':
+                $constructor = $constructor['message'];
+                // no break
+            case 'message':
+                $constructor = $constructor['media'];
+        }
+        return $this->genAllFile($constructor);
+    }
+    /**
+     * Gets info of the propic of a user.
+     */
+    public function getPropicInfo($data): ?Photo
+    {
+        if (!$this->getSettings()->getDb()->getEnableFullPeerDb()) {
+            throw new AssertionError("getPropicInfo cannot be used if the full peer database is disabled!");
+        }
+        return $this->getPwrChat($data, false)['photo'] ?? null;
+    }
+    /**
+     * Extract file info from bot API message.
+     *
+     * @param array $info Bot API message object
+     *
+     * @psalm-pure
+     */
+    public static function extractBotAPIFile(array $info): array|null
+    {
+        foreach (FileIdType::cases() as $type) {
+            if (isset($info[$type->value]) && \is_array($info[$type->value])) {
+                $method = $type->value;
+                break;
+            }
+        }
+        if (!isset($method)) {
+            return null;
+        }
+        $info = $info[$method];
+        if ($method === 'photo') {
+            $info = array_values($info);
+            $cur = $info[0];
+            foreach ($info as $n) {
+                /** @psalm-suppress InvalidArrayAccess */
+                if ($n['width'] * $n['height'] > $cur['width'] * $cur['height']) {
+                    $cur = $n;
+                }
+            }
+            $info = $cur;
+        }
+        $info['file_type'] = $method;
+        return $info;
+    }
+    /**
+     * Get download info of file
+     * Returns an array with the following structure:.
+     *
+     * `$info['ext']` - The file extension
+     * `$info['name']` - The file name, without the extension
+     * `$info['mime']` - The file mime type
+     * `$info['size']` - The file size
+     *
+     * @param mixed $messageMedia File ID
+     *
+     * @return array{
+     *      ext: string,
+     *      name: string,
+     *      mime: string,
+     *      size: int,
+     *      InputFileLocation: array,
+     *      key_fingerprint?: string,
+     *      key?: string,
+     *      iv?: string,
+     *      thumb_size?: string
+     * }
+     */
+    public function getDownloadInfo(mixed $messageMedia): array
+    {
+        if ($messageMedia instanceof BotApiFileId) {
+            $res = $this->getDownloadInfo($messageMedia->fileId);
+            $res['size'] = $messageMedia->size;
+            $pathinfo = pathinfo($messageMedia->fileName);
+            if (isset($pathinfo['extension'])) {
+                $res['ext'] = '.'.$pathinfo['extension'];
+            } else {
+                $res['ext'] = '';
+            }
+            $res['name'] = $pathinfo['filename'];
+            return $res;
+        }
+        if ($messageMedia instanceof Message) {
+            $messageMedia = $messageMedia->media;
+        }
+        if ($messageMedia instanceof Media) {
+            return $messageMedia->getDownloadInfo();
+        }
+        if (\is_string($messageMedia)) {
+            $inline = InlineThumbnail::unpackFileId($messageMedia, $this->getInlineFileIdKey());
+            if ($inline !== null) {
+                return $inline;
+            }
+            $messageMedia = $this->unpackFileId($messageMedia);
+            if (isset($messageMedia['InputFileLocation'])) {
+                return $messageMedia;
+            }
+            $messageMedia = $messageMedia['MessageMedia'];
+        }
+        if (!isset($messageMedia['_'])) {
+            if (!isset($messageMedia['InputFileLocation']) && !isset($messageMedia['file_id'])) {
+                $messageMedia = self::extractBotAPIFile($messageMedia) ?? $messageMedia;
+            }
+            if (isset($messageMedia['file_id'])) {
+                $res = $this->getDownloadInfo($messageMedia['file_id']);
+                $pathinfo = pathinfo($messageMedia['file_name']);
+                if (isset($pathinfo['extension'])) {
+                    $res['ext'] = '.'.$pathinfo['extension'];
+                } else {
+                    $res['ext'] = '';
+                }
+                $res['name'] = $pathinfo['filename'];
+                return $res;
+            }
+            return $messageMedia;
+        }
+        $res = [];
+        switch ($messageMedia['_']) {
+            // Updates
+            case 'updateNewMessage':
+            case 'updateNewChannelMessage':
+            case 'updateEditMessage':
+            case 'updateEditChannelMessage':
+                $messageMedia = $messageMedia['message'];
+                // no break
+            case 'message':
+                return $this->getDownloadInfo($messageMedia['media']);
+            case 'storyItem':
+                return $this->getDownloadInfo($messageMedia['media']);
+            case 'updateNewEncryptedMessage':
+                $messageMedia = $messageMedia['message'];
+                // Secret media
+                // no break
+            case 'encryptedMessage':
+                if ($messageMedia['decrypted_message']['media']['_'] !== 'decryptedMessageMediaExternalDocument') {
+                    $messageMedia['decrypted_message']['media']['file'] = $messageMedia['file'];
+                }
+                return $this->getDownloadInfo($messageMedia['decrypted_message']['media']);
+            case 'decryptedMessageMediaPhoto':
+            case 'decryptedMessageMediaVideo':
+            case 'decryptedMessageMediaDocument':
+            case 'decryptedMessageMediaAudio':
+                $res['InputFileLocation'] = ['_' => 'inputEncryptedFileLocation', 'id' => $messageMedia['file']['id'], 'access_hash' => $messageMedia['file']['access_hash'], 'dc_id' => $messageMedia['file']['dc_id']];
+                $res['size'] = $messageMedia['size'];
+                $res['key_fingerprint'] = $messageMedia['file']['key_fingerprint'];
+                $res['key'] = $messageMedia['key'];
+                $res['iv'] = $messageMedia['iv'];
+                if (isset($messageMedia['file_name'])) {
+                    $pathinfo = pathinfo($messageMedia['file_name']);
+                    if (isset($pathinfo['extension'])) {
+                        $res['ext'] = '.'.$pathinfo['extension'];
+                    } else {
+                        $res['ext'] = '';
+                    }
+                    $res['name'] = $pathinfo['filename'];
+                }
+                if (isset($messageMedia['mime_type'])) {
+                    $res['mime'] = $messageMedia['mime_type'];
+                } elseif ($messageMedia['_'] === 'decryptedMessageMediaPhoto') {
+                    $res['mime'] = 'image/jpeg';
+                }
+                if (isset($messageMedia['attributes'])) {
+                    foreach ($messageMedia['attributes'] as $attribute) {
+                        switch ($attribute['_']) {
+                            case 'documentAttributeFilename':
+                                $pathinfo = pathinfo($attribute['file_name']);
+                                if (isset($pathinfo['extension'])) {
+                                    $res['ext'] = '.'.$pathinfo['extension'];
+                                } else {
+                                    $res['ext'] = '';
+                                }
+                                $res['name'] = $pathinfo['filename'];
+                                break;
+                            case 'documentAttributeAudio':
+                                $audio = $attribute;
+                                break;
+                        }
+                    }
+                }
+                if (isset($audio) && isset($audio['title']) && !isset($res['name'])) {
+                    $res['name'] = $audio['title'];
+                    if (isset($audio['performer'])) {
+                        $res['name'] .= ' - '.$audio['performer'];
+                    }
+                }
+                if (!isset($res['ext']) || $res['ext'] === '') {
+                    $res['ext'] = Tools::getExtensionFromLocation($res['InputFileLocation'], Tools::getExtensionFromMime($res['mime'] ?? 'image/jpeg'));
+                }
+                if (!isset($res['mime']) || $res['mime'] === '') {
+                    $res['mime'] = Tools::getMimeFromExtension($res['ext'], 'image/jpeg');
+                }
+                if (!isset($res['name']) || $res['name'] === '') {
+                    $res['name'] = Tools::unpackSignedLongString($messageMedia['file']['access_hash']);
+                }
+                return $res;
+                // Wallpapers
+            case 'wallPaper':
+                return $this->getDownloadInfo($messageMedia['document']);
+                // Photos
+            case 'photo':
+                $messageMedia = ['_' => 'messageMediaPhoto', 'photo' => $messageMedia, 'ttl_seconds' => 0];
+                // no break
+            case 'messageMediaPhoto':
+                $res['MessageMedia'] = $messageMedia;
+                $messageMedia = $messageMedia['photo'];
+                $size = Tools::maxSize($messageMedia['sizes']);
+                if (isset($size['volume_id'])) {
+                    $res['InputFileLocation'] = [
+                        '_' => 'inputPhotoLegacyFileLocation',
+                        'id' => $messageMedia['id'],
+                        'access_hash' => $messageMedia['access_hash'],
+                        'dc_id' => $messageMedia['dc_id'],
+                        'file_reference' => $this->referenceDatabase->getReference(ReferenceDatabase::PHOTO, $messageMedia),
+                        'volume_id' => $size['volume_id'],
+                        'local_id' => $size['local_id'],
+                        'secret' => $size['secret'],
+                    ];
+                } else {
+                    $res = array_merge($res, $this->getDownloadInfo($size));
+                    $res['InputFileLocation'] = [
+                        '_' => 'inputPhotoFileLocation',
+                        'id' => $messageMedia['id'],
+                        'access_hash' => $messageMedia['access_hash'],
+                        'dc_id' => $messageMedia['dc_id'],
+                        'file_reference' => $this->referenceDatabase->getReference(ReferenceDatabase::PHOTO, $messageMedia),
+                        'thumb_size' => $res['thumb_size'] ?? 'x',
+                    ];
+                }
+                $res['name'] = Tools::unpackSignedLongString($messageMedia['id']).'_'.($res['thumb_size'] ?? 'x').'_'.$messageMedia['dc_id'];
+                $res['ext'] = '.jpg';
+                $res['mime'] = 'image/jpeg';
+                return $res;
+            case 'user':
+            case 'folder':
+            case 'channel':
+            case 'chat':
+            case 'updateUserPhoto':
+                $res = ($this->getDownloadInfo($messageMedia['photo']));
+                $res['InputFileLocation'] = [
+                    '_' => 'inputPeerPhotoFileLocation',
+                    'big' => true,
+                    'peer' => $this->getInfo($messageMedia, \danog\MadelineProto\API::INFO_TYPE_ID),
+                    'photo_id' => $res['InputFileLocation']['photo_id'],
+                ];
+                $res['name'] = Tools::unpackSignedLongString($messageMedia['id']).'_'.($res['thumb_size'] ?? 'x').'_'.$messageMedia['photo']['dc_id'];
+                $res['ext'] = '.jpg';
+                $res['mime'] = 'image/jpeg';
+                return $res;
+            case 'userProfilePhoto':
+            case 'chatPhoto':
+                $res['InputFileLocation']['has_video'] = $messageMedia['has_video'] ?? false;
+                $res['InputFileLocation']['photo_id'] = $messageMedia['photo_id'];
+                $res['InputFileLocation']['dc_id'] = $messageMedia['dc_id'];
+                return $res;
+            case 'photoStrippedSize':
+                // The JPEG, as downloaded by InlineThumbnail.
+                $res['data'] = Tools::inflateStripped((string) $messageMedia['bytes']);
+                $res['size'] = \strlen($res['data']);
+                $res['thumb_size'] = 'JPG';
+                return $res;
+            case 'photoCachedSize':
+                $res['data'] = (string) $messageMedia['bytes'];
+                $res['size'] = \strlen($res['data']);
+                $res['thumb_size'] = $messageMedia['type'];
+                return $res;
+            case 'photoSize':
+                $res['thumb_size'] = $messageMedia['type'];
+                //$res['thumb_size'] = $size;
+                if (isset($messageMedia['size'])) {
+                    $res['size'] = $messageMedia['size'];
+                }
+                return $res;
+            case 'photoSizeProgressive':
+                $res['thumb_size'] = $messageMedia['type'];
+                if (isset($messageMedia['sizes'])) {
+                    $res['size'] = end($messageMedia['sizes']);
+                }
+                return $res;
+                // Documents
+            case 'decryptedMessageMediaExternalDocument':
+            case 'document':
+                $messageMedia = ['_' => 'messageMediaDocument', 'ttl_seconds' => 0, 'document' => $messageMedia];
+                // no break
+            case 'messageMediaDocument':
+                $res['MessageMedia'] = $messageMedia;
+                foreach ($messageMedia['document']['attributes'] as $attribute) {
+                    switch ($attribute['_']) {
+                        case 'documentAttributeFilename':
+                            $pathinfo = pathinfo($attribute['file_name']);
+                            if (isset($pathinfo['extension'])) {
+                                $res['ext'] = '.'.$pathinfo['extension'];
+                            }
+                            $res['name'] = $pathinfo['filename'];
+                            break;
+                        case 'documentAttributeAudio':
+                            $audio = $attribute;
+                            break;
+                    }
+                }
+                if (isset($audio) && isset($audio['title']) && !isset($res['name'])) {
+                    $res['name'] = $audio['title'];
+                    if (isset($audio['performer'])) {
+                        $res['name'] .= ' - '.$audio['performer'];
+                    }
+                }
+                $res['InputFileLocation'] = ['_' => 'inputDocumentFileLocation', 'id' => $messageMedia['document']['id'], 'access_hash' => $messageMedia['document']['access_hash'], 'version' => $messageMedia['document']['version'] ?? 0, 'dc_id' => $messageMedia['document']['dc_id'], 'file_reference' => $this->referenceDatabase->getReference(ReferenceDatabase::DOCUMENT, $messageMedia['document'])];
+                if (!isset($res['ext']) || $res['ext'] === '') {
+                    $res['ext'] = Tools::getExtensionFromLocation($res['InputFileLocation'], Tools::getExtensionFromMime($messageMedia['document']['mime_type']));
+                }
+                if (!isset($res['name']) || $res['name'] === '') {
+                    $res['name'] = Tools::unpackSignedLongString($messageMedia['document']['access_hash']);
+                }
+                if (isset($messageMedia['document']['size'])) {
+                    $res['size'] = $messageMedia['document']['size'];
+                }
+                $res['name'] .= '_'.Tools::unpackSignedLongString($messageMedia['document']['id']);
+                $res['mime'] = $messageMedia['document']['mime_type'];
+                return $res;
+            default:
+                throw new Exception('Invalid constructor provided: '.$messageMedia['_']);
+        }
+    }
+    /**
+     * Download file to directory.
+     *
+     * @param mixed                        $messageMedia File to download
+     * @param string|FileCallbackInterface $dir          Directory where to download the file
+     * @param callable                     $cb           Callback
+     *
+     * @return non-empty-string Downloaded file name
+     */
+    public function downloadToDir(mixed $messageMedia, string|FileCallbackInterface $dir, ?callable $cb = null, ?Cancellation $cancellation = null): string
+    {
+        if (\is_object($dir) && $dir instanceof FileCallbackInterface) {
+            $cb = $dir;
+            $dir = $dir->getFile();
+        }
+        $messageMedia = ($this->getDownloadInfo($messageMedia));
+        return $this->downloadToFile($messageMedia, $dir.'/'.$messageMedia['name'].$messageMedia['ext'], $cb, $cancellation);
+    }
+    /**
+     * Download file.
+     *
+     * @param mixed                        $messageMedia File to download
+     * @param string|FileCallbackInterface $file         Downloaded file path
+     * @param callable                     $cb           Callback
+     *
+     * @return non-empty-string Downloaded file name
+     */
+    public function downloadToFile(mixed $messageMedia, string|FileCallbackInterface $file, ?callable $cb = null, ?Cancellation $cancellation = null): string
+    {
+        if (\is_object($file) && $file instanceof FileCallbackInterface) {
+            $cb = $file;
+            $file = $file->getFile();
+        }
+        $file = Tools::absolute(preg_replace('|/+|', '/', $file));
+        if (!file_exists($file)) {
+            touch($file);
+        }
+        $file = realpath($file);
+        Assert::notEmpty($file);
+        $messageMedia = ($this->getDownloadInfo($messageMedia));
+        $size = getSize($file);
+        $stream = openFile($file, 'cb');
+        $this->logger->logger('Waiting for lock of file to download...');
+        $unlock = Tools::flock("$file.lock", LOCK_EX);
+        $this->logger->logger('Got lock of file to download');
+        async($this->downloadToStream(...), $messageMedia, $stream, $cb, $size, -1, $cancellation)->finally(static function () use ($stream, $unlock, $file): void {
+            $stream->close();
+            $unlock();
+            try {
+                deleteFile("$file.lock");
+            } catch (\Throwable) {
+            }
+        })->await($cancellation);
+        return $file;
+    }
+    /**
+     * Download file to callable.
+     * The callable must accept two parameters: string $payload, int $offset
+     * The callable will be called (possibly out of order, depending on the value of $seekable).
+     *
+     * @param mixed                          $messageMedia File to download
+     * @param callable|FileCallbackInterface $callable     Chunk callback
+     * @param callable                       $cb           Status callback
+     * @param bool                           $seekable     Whether the callable can be called out of order
+     * @param int                            $offset       Offset where to start downloading
+     * @param int                            $end          Offset where to stop downloading (inclusive)
+     * @param int                            $part_size    Size of each chunk
+     */
+    public function downloadToCallable(mixed $messageMedia, callable $callable, ?callable $cb = null, bool $seekable = true, int $offset = 0, int $end = -1, ?int $part_size = null, ?Cancellation $cancellation = null): void
+    {
+        $messageMedia = ($this->getDownloadInfo($messageMedia));
+        if (\is_object($callable) && $callable instanceof FileCallbackInterface) {
+            $cb = $callable;
+            $callable = $callable->getFile();
+        }
+        if (!\is_callable($callable)) {
+            throw new Exception('Wrong callable provided');
+        }
+        if ($cb === null) {
+            $cb = function (float $percent, float $speed, float $time): void {
+                $this->logger->logger('Download status: '.$percent.'%', Logger::NOTICE);
+            };
+        } else {
+            $cb = static function (float $percent, float $speed, float $time) use ($cb): void {
+                EventLoop::queue(static function () use ($percent, $speed, $time, $cb): void {
+                    try {
+                        $cb($percent, $speed, $time);
+                    } catch (ChannelException) {
+                        // The IPC client this progress was meant for is gone.
+                    }
+                });
+            };
+        }
+        if ($end === -1 && isset($messageMedia['size']) && $messageMedia['size'] !== 0) {
+            $end = $messageMedia['size'];
+        }
+        if (isset($messageMedia['data'])) {
+            // Inlined in the media (like the stripped preview of a photo): served from memory.
+            $data = (string) $messageMedia['data'];
+            $payload = substr($data, $offset, $end === -1 ? null : $end - $offset);
+            if ($payload !== '') {
+                $callable($payload, $offset);
+            }
+            $cb(100.0, 0.0, 0.0);
+            return;
+        }
+        if ($part_size === null) {
+            $part_size = 1024 * 1024;
+            if ($end > $offset && !isset($messageMedia['key'])) {
+                // Short ranges (such as browser metadata probes) need not fetch a whole MiB.
+                while ($part_size > 4096 && ($part_size >> 1) >= $end - $offset) {
+                    $part_size >>= 1;
+                }
+            }
+        }
+        $parallel_chunks = $this->settings->getFiles()->getDownloadParallelChunks();
+        if (isset($messageMedia['InputFileLocation']['dc_id'])) {
+            $datacenter = $this->isTestMode() ? 10_000 + $messageMedia['InputFileLocation']['dc_id'] : $messageMedia['InputFileLocation']['dc_id'];
+        } else {
+            $datacenter = $this->loginState->getState()->authorizedDc;
+        }
+        if ($this->datacenter->has(-$datacenter)) {
+            $datacenter = -$datacenter;
+        }
+        if (isset($messageMedia['key'])) {
+            $messageMedia['key'] = (string) $messageMedia['key'];
+            $messageMedia['iv'] = (string) $messageMedia['iv'];
+            $digest = Crypt::md5($messageMedia['key'].$messageMedia['iv']);
+            $fingerprint = Tools::unpackSignedInt(substr($digest, 0, 4) ^ substr($digest, 4, 4));
+            if ($fingerprint !== $messageMedia['key_fingerprint']) {
+                throw new Exception('Fingerprint mismatch!');
+            }
+            $ige = IGE::getInstance($messageMedia['key'], $messageMedia['iv']);
+            $seekable = false;
+        }
+        if ($offset === $end) {
+            $cb(100.0, 0.0, 0);
+            return;
+        }
+        $params = [];
+        $start_at = $offset % $part_size;
+        $probable_end = $end !== -1 ? $end : 512 * 1024 * 8000;
+        $breakOut = false;
+        for ($x = $offset - $start_at; $x < $probable_end; $x += $part_size) {
+            $end_at = $part_size;
+            if ($end !== -1 && $x + $part_size > $end) {
+                $end_at = $end % $part_size;
+                $breakOut = true;
+            }
+            $params[] = ['offset' => $x, 'limit' => $part_size, 'part_start_at' => $start_at, 'part_end_at' => $end_at];
+            $start_at = 0;
+            if ($breakOut) {
+                break;
+            }
+        }
+        if (!$params) {
+            $cb(100, 0, 0);
+            return;
+        }
+        $count = \count($params);
+        $cdn = false;
+        if (isset($messageMedia['key']) && $params[0]['offset'] > 0) {
+            // IGE decryption is chained: each block depends on the previous plaintext block,
+            // so resuming requires decrypting everything before the first requested part.
+            $this->logger->logger("Decrypting the first {$params[0]['offset']} bytes of an encrypted file to start downloading from offset $offset");
+            $skip = static fn (string $payload): int => \strlen($payload);
+            $noop = static function (int $bytes): void {
+            };
+            for ($x = 0; $x < $params[0]['offset']; $x += $part_size) {
+                $this->downloadPart($messageMedia, $cdn, $datacenter, $old_dc, $ige, $noop, ['offset' => $x, 'limit' => $part_size, 'part_start_at' => 0, 'part_end_at' => $part_size, 'previous_promise' => true], $skip, false, $cancellation);
+            }
+        }
+        $params[0]['previous_promise'] = true;
+        $start = hrtime(true);
+        $progress = new TransferProgress($cb, $count);
+        $size = $this->downloadPart($messageMedia, $cdn, $datacenter, $old_dc, $ige, $progress->partDone(...), $initParam = array_shift($params), $callable, $seekable, $cancellation);
+        if ($initParam['part_end_at'] - $initParam['part_start_at'] !== $size) {
+            // Premature end for undefined length files
+            $cb(100, $progress->getSpeed(), $progress->getTime());
+            return;
+        }
+        $parallel_chunks = $seekable ? $parallel_chunks : 2;
+        if ($params) {
+            $previous_promise = true;
+            $promises = [];
+            $finished = false;
+            foreach ($params as $param) {
+                $cancellation?->throwIfRequested();
+                $param['previous_promise'] = $previous_promise;
+                $previous_promise = async($this->downloadPart(...), $messageMedia, $cdn, $datacenter, $old_dc, $ige, $progress->partDone(...), $param, $callable, $seekable, $cancellation)->ignore();
+                $previous_promise->map(static function (int $res) use (&$size, &$finished): void {
+                    $size += $res;
+                    if ($res === 0) {
+                        $finished = true;
+                    }
+                })->ignore();
+                $promises[] = $previous_promise;
+                if (\count($promises) === $parallel_chunks) {
+                    // 20 mb at a time, for a typical bandwidth of 1gbps
+                    awaitFirst($promises, $cancellation);
+                    foreach ($promises as $k => $p) {
+                        if ($p->isComplete()) {
+                            unset($promises[$k]);
+                            break;
+                        }
+                    }
+                    if ($finished) {
+                        break;
+                    }
+                }
+            }
+            if ($promises) {
+                await($promises, $cancellation);
+            }
+        }
+        $time = (hrtime(true) - $start) / 1e9;
+        $speed = (int) ($size * 8 / $time) / 1000000;
+        $this->logger->logger("Total download time: {$time}");
+        $this->logger->logger("Total download speed: {$speed} mbps");
+        if ($cdn) {
+            $this->clearCdnHashes($messageMedia['file_token']);
+        }
+        if (!isset($messageMedia['size'])) {
+            $cb(100.0, $speed, $time);
+        }
+    }
+    /**
+     * Download file part.
+     *
+     * @param array    $messageMedia File object
+     * @param bool     $cdn          Whether this is a CDN file
+     * @param int      $datacenter   DC ID
+     * @param null|int $old_dc       Previous DC ID
+     * @param IGE      $ige          IGE decryptor instance
+     * @param callable(int): void $cb Status callback, called with the number of bytes of the part once it is written
+     * @param array    $offset       Offset
+     * @param callable $callable     Chunk callback
+     * @param boolean  $seekable     Whether the download file is seekable
+     */
+    private function downloadPart(array &$messageMedia, bool &$cdn, int &$datacenter, ?int &$old_dc, ?IGE &$ige, callable $cb, array $offset, callable $callable, bool $seekable, ?Cancellation $cancellation): int
+    {
+        do {
+            if (!$cdn) {
+                $basic_param = ['location' => $messageMedia['InputFileLocation'], 'cdn_supported' => true, 'floodWaitLimit' => 0, 'cancellation' => $cancellation, 'specialMethodType' => SpecialMethodType::FILE_RELATED];
+            } else {
+                $basic_param = ['file_token' => $messageMedia['file_token'], 'floodWaitLimit' => 0, 'cancellation' => $cancellation, 'specialMethodType' => SpecialMethodType::FILE_RELATED];
+            }
+            do {
+                $cancellation?->throwIfRequested();
+                try {
+                    $request = $cdn ? $this->getCdnPartRequest($messageMedia['file_token'], $offset, $cancellation) : $offset;
+                    $res = $this->methodCallAsyncRead(
+                        $cdn ? 'upload.getCdnFile' : 'upload.getFile',
+                        ['offset' => $request['offset'], 'limit' => $request['limit']] + $basic_param,
+                        $datacenter
+                    );
+                    break;
+                } catch (FileRedirect $e) {
+                    $datacenter = $e->dc;
+                } catch (FloodWaitError $e) {
+                    $this->datacenter->getDataCenterConnection($datacenter)->waitAfterFileFlood($e, $cancellation);
+                } catch (FloodPremiumWaitError $e) {
+                    $e->wait($cancellation);
+                } catch (FileTokenInvalidError) {
+                    $cdn = false;
+                    $datacenter = $this->loginState->getState()->authorizedDc;
+                    continue 2;
+                }
+            } while (true);
+            $cancellation?->throwIfRequested();
+
+            if ($res['_'] === 'upload.fileCdnRedirect') {
+                $cdn = true;
+                $messageMedia['file_token'] = $res['file_token'];
+                $messageMedia['cdn_key'] = $res['encryption_key'];
+                $messageMedia['cdn_iv'] = $res['encryption_iv'];
+                $this->addCdnHashes($res['file_token'], $res['file_hashes']);
+                $datacenter = ($this->isTestMode() ? 10_000 : 0) + $res['dc_id'];
+                if (!$this->datacenter->has($datacenter)) {
+                    $this->config['expires'] = -1;
+                    $this->getConfig();
+                }
+                $this->logger->logger('File is stored on CDN!', Logger::NOTICE);
+                continue;
+            } elseif ($res['_'] === 'upload.cdnFileReuploadNeeded') {
+                $this->logger->logger('File is not stored on CDN, requesting reupload!', Logger::NOTICE);
+                $this->config['expires'] = 0;
+                $this->getConfig();
+                try {
+                    $this->addCdnHashes($messageMedia['file_token'], $this->methodCallAsyncRead('upload.reuploadCdnFile', ['file_token' => $messageMedia['file_token'], 'request_token' => $res['request_token'], 'cancellation' => $cancellation], $this->loginState->getState()->authorizedDc));
+                } catch (FileTokenInvalidError|RequestTokenInvalidError) {
+                    $cdn = false;
+                    $datacenter = $this->loginState->getState()->authorizedDc;
+                    continue;
+                }
+                continue;
+            }
+            $res['bytes'] = (string) $res['bytes'];
+            if ($cdn === false && $res['type']['_'] === 'storage.fileUnknown' && $res['bytes'] === '') {
+                $datacenter = 0;
+            }
+            while ($cdn === false && $res['type']['_'] === 'storage.fileUnknown' && $res['bytes'] === '' && $this->datacenter->has(++$datacenter)) {
+                try {
+                    $res = $this->methodCallAsyncRead('upload.getFile', $basic_param + $offset, $datacenter);
+                } catch (FileRedirect $e) {
+                    $datacenter = $e->dc;
+                    break;
+                }
+            }
+            $cancellation?->throwIfRequested();
+            $res['bytes'] = (string) $res['bytes'];
+            if ($cdn) {
+                if ($request['length'] !== null && \strlen($res['bytes']) > $request['length']) {
+                    throw new SecurityException('The CDN returned data that the hashes of the file don\'t cover, at offset '.$request['offset']);
+                }
+                if ($request['length'] && $res['bytes'] === '') {
+                    throw new SecurityException('Incomplete CDN hash block at offset '.$request['offset']);
+                }
+                $iv = substr($messageMedia['cdn_iv'], 0, 12).pack('N', $request['offset'] >> 4);
+                $res['bytes'] = Crypt::ctrEncrypt($res['bytes'], $messageMedia['cdn_key'], $iv);
+                $this->checkCdnHash($messageMedia['file_token'], $request['offset'], $res['bytes'], \strlen($res['bytes']) < $request['limit'], $cancellation);
+                $res['bytes'] = substr($res['bytes'], $offset['offset'] - $request['offset'], $offset['limit']);
+                // A CDN answer that stops at the end of a hash block passes every hash: only the size of the file
+                // (from the main DC) shows that the file doesn't end there.
+                if (!empty($messageMedia['size'])
+                    && \strlen($res['bytes']) < min($offset['limit'], $messageMedia['size'] - $offset['offset'])
+                ) {
+                    throw new SecurityException('The CDN ended the file early, at offset '.($offset['offset'] + \strlen($res['bytes'])).' of '.$messageMedia['size']);
+                }
+            }
+            if ($res['bytes'] === '') {
+                return 0;
+            }
+            if (!$seekable && $offset['previous_promise'] instanceof Future) {
+                $offset['previous_promise']->await($cancellation);
+            }
+            if (isset($messageMedia['key'])) {
+                // IGE decryption is chained, so parts must be decrypted in order (encrypted downloads are never seekable).
+                $res['bytes'] = $ige->decrypt($res['bytes']);
+            }
+            if ($offset['part_start_at'] || $offset['part_end_at'] !== $offset['limit']) {
+                $res['bytes'] = substr($res['bytes'], $offset['part_start_at'], $offset['part_end_at'] - $offset['part_start_at']);
+            }
+            $len = \strlen($res['bytes']);
+            $res = $callable($res['bytes'], $offset['offset'] + $offset['part_start_at']);
+            if ($res instanceof Future) {
+                $res = $res->await($cancellation);
+            }
+            $cb($len);
+            return $len;
+        } while (true);
+    }
+    /**
+     * Get the request for a part of a CDN file.
+     *
+     * CDN data is verified on whole hash blocks: a part made of whole blocks is requested as is, and a part
+     * inside a block (smaller than it) as the whole block, to be cut out of it after verification. Telegram's
+     * hash blocks are 128 KiB long, at multiples of 128 KiB (Telegram Desktop only downloads them so), so one
+     * request always covers the block; the last block of a file can be shorter.
+     *
+     * @return array{offset: int, limit: int, length: ?int} The request, and how many bytes of hash blocks it can
+     *                                                          return (null if no hash was looked up)
+     */
+    private function getCdnPartRequest(string $file, array $part, ?Cancellation $cancellation): array
+    {
+        if ($part['limit'] >= 1024 * 1024) {
+            // Whole blocks, which are at most 1 MiB long.
+            return ['offset' => $part['offset'], 'limit' => $part['limit'], 'length' => null];
+        }
+        $block = $this->getCdnHash($file, $part['offset'], $cancellation);
+        if ($block === null) {
+            // The main DC has no hash this far: the file ends before this part.
+            return ['offset' => $part['offset'], 'limit' => $part['limit'], 'length' => 0];
+        }
+        if ($block['offset'] === $part['offset'] && $part['limit'] >= $block['limit']) {
+            return ['offset' => $part['offset'], 'limit' => $part['limit'], 'length' => $part['limit']];
+        }
+        $limit = 4096;
+        while ($limit < $block['limit']) {
+            $limit <<= 1;
+        }
+        if ($limit > 1024 * 1024 || $block['offset'] % $limit !== 0
+            || $part['offset'] + $part['limit'] > $block['offset'] + $limit
+        ) {
+            throw new Exception("Unsupported CDN hash block of {$block['limit']} bytes at offset {$block['offset']}");
+        }
+        return ['offset' => $block['offset'], 'limit' => $limit, 'length' => $block['limit']];
+    }
+    /**
+     * @var array<string, array<int, array{limit: int, hash: string}>>
+     */
+    private array $cdn_hashes = [];
+    /**
+     * @psalm-external-mutation-free
+     */
+    private function addCdnHashes(string $file, array $hashes): void
+    {
+        foreach ($hashes as $hash) {
+            $this->cdn_hashes[$file] ??= [];
+            $this->cdn_hashes[$file][$hash['offset']] = ['limit' => $hash['limit'], 'hash' => (string) $hash['hash']];
+        }
+    }
+    /** @return ?array{offset: int, limit: int, hash: string} The hash block containing the offset, null if the main DC has none */
+    private function getCdnHash(string $file, int $offset, ?Cancellation $cancellation): ?array
+    {
+        if (isset($this->cdn_hashes[$file][$offset])) {
+            return ['offset' => $offset] + $this->cdn_hashes[$file][$offset];
+        }
+        for ($attempt = 0; $attempt < 2; $attempt++) {
+            foreach ($this->cdn_hashes[$file] ?? [] as $start => $hash) {
+                if ($start <= $offset && $offset < $start + $hash['limit']) {
+                    return ['offset' => $start] + $hash;
+                }
+            }
+            if ($attempt === 0) {
+                $this->addCdnHashes($file, $this->methodCallAsyncRead('upload.getCdnFileHashes', ['file_token' => $file, 'offset' => $offset, 'cancellation' => $cancellation], $this->loginState->getState()->authorizedDc));
+            }
+        }
+        return null;
+    }
+    /**
+     * @param bool $eof Whether $data ends at the end of the file, whose last block can be shorter than the limit of its hash (as in TDLib).
+     */
+    private function checkCdnHash(string $file, int $offset, string $data, bool $eof, ?Cancellation $cancellation): void
+    {
+        while (\strlen($data)) {
+            $hash = $this->getCdnHash($file, $offset, $cancellation) ?? throw new SecurityException('No CDN hash for offset '.$offset);
+            if ($hash['offset'] !== $offset || (!$eof && \strlen($data) < $hash['limit']) || Crypt::sha256(substr($data, 0, $hash['limit'])) !== $hash['hash']) {
+                throw new SecurityException('CDN hash mismatch for offset '.$offset);
+            }
+            $data = substr($data, $hash['limit']);
+            $offset += $hash['limit'];
+        }
+    }
+
+    /**
+     * @psalm-external-mutation-free
+     */
+    private function clearCdnHashes(string $file): void
+    {
+        unset($this->cdn_hashes[$file]);
+    }
+}

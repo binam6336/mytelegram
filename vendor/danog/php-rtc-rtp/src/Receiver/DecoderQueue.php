@@ -1,0 +1,158 @@
+<?php
+
+/**
+ * This file is part of the PHP WebRTC package.
+ *
+ * (c) Amin Yazdanpanah <https://www.aminyazdanpanah.com/#contact>
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Webrtc\RTP\Receiver;
+
+use Amp\Pipeline\Queue;
+use Revolt\EventLoop;
+use Webrtc\AVCodec\Frame\FrameInterface;
+use Webrtc\Codecs\DecoderInterface;
+use Webrtc\Mixin\SerializableState;
+use Webrtc\RTP\Jitter\JitterFrame;
+use Webrtc\RTP\MediaStreamTrack\RemoteStreamTrack;
+
+/**
+ * Class DecoderQueue
+ *
+ * Manages a queue of frames for asynchronous decoding and playback.
+ */
+final class DecoderQueue
+{
+    /** @var Queue<JitterFrame> Queue for storing incoming jitter frames. */
+    private Queue $queue;
+
+    private bool $running = false;
+
+    private ?RemoteStreamTrack $track = null;
+
+    /**
+     * DecoderQueue constructor.
+     *
+     * @param DecoderInterface $decoder Decoder used for every frame added to this queue.
+     */
+    public function __construct(private readonly DecoderInterface $decoder)
+    {
+        /** @var Queue<JitterFrame> */
+        $this->queue = new Queue();
+    }
+
+    /**
+     * Adds a frame to the processing queue.
+     *
+     * @param JitterFrame $frame The frame to enqueue for decoding.
+     */
+    public function addFrame(JitterFrame $frame): void
+    {
+        $this->queue->push($frame);
+    }
+
+    /**
+     * Starts processing the frame queue and sends decoded frames to the track.
+     *
+     * @param RemoteStreamTrack $track The track to send decoded frames to.
+     */
+    public function start(RemoteStreamTrack $track): void
+    {
+        if ($this->running) {
+            throw new \RuntimeException('DecoderQueue is already started.');
+        }
+        $this->track = $track;
+        $this->running = true;
+        EventLoop::queue($this->drain(...));
+    }
+
+    /**
+     * Drain queued frames onto the track.
+     *
+     * Restarted only as the first-class callable `$this->drain(...)` handed to EventLoop::queue(),
+     * including when unserialize re-queues it. That callable captures this method's private scope,
+     * so the event loop can run it while it stays private.
+     */
+    private function drain(): void
+    {
+        $track = $this->track;
+        if ($track === null) {
+            $this->running = false;
+
+            return;
+        }
+        // Park the decode loop on the queue iterator, not on $this. Iterating inside an instance
+        // method keeps $this on the parked fiber's stack, pinning this queue (and the receiver that
+        // owns it) in the event loop forever — an unset()+gc could never reclaim it. Holding only
+        // the iterator and a weak reference lets the owner be collected; __destruct() then
+        // completes the queue so this fiber unwinds.
+        $weak = \WeakReference::create($this);
+        $iterator = $this->queue->iterate();
+        EventLoop::queue(static function () use ($weak, $iterator, $track): void {
+            foreach ($iterator as $frame) {
+                $self = $weak->get();
+                if ($self === null) {
+                    return;
+                }
+                $decodedFrame = $self->decoder->decode($frame);
+                /** @var FrameInterface[] $decodedFrame */
+                foreach ($decodedFrame as $decoded) {
+                    $track->queueFrame($decoded);
+                }
+                unset($self);
+            }
+            $self = $weak->get();
+            if ($self !== null) {
+                $self->running = false;
+            }
+        });
+    }
+
+    public function __destruct()
+    {
+        if (!$this->queue->isComplete()) {
+            $this->queue->complete();
+        }
+    }
+
+    /**
+     * Stops the processing of the frame queue and cancels the scheduled task.
+     */
+    public function stop(): void
+    {
+        $this->queue->complete();
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function __serialize(): array
+    {
+        return SerializableState::export($this, [
+            'queue' => null,
+        ]);
+    }
+
+    /**
+     * @param array<string, mixed> $data
+     */
+    public function __unserialize(array $data): void
+    {
+        foreach (array_keys($data) as $key) {
+            if (str_ends_with($key, "\0queue")) {
+                unset($data[$key]);
+            }
+        }
+        SerializableState::import($this, $data);
+        /** @var Queue<JitterFrame> $queue */
+        $queue = new Queue();
+        $this->queue = $queue;
+        if ($this->running && $this->track !== null) {
+            $this->running = false;
+            $this->start($this->track);
+        }
+    }
+}

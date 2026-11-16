@@ -1,0 +1,783 @@
+<?php declare(strict_types=1);
+
+namespace Amp\Http\Client;
+
+use Amp\ByteStream\ReadableBuffer;
+use Amp\ByteStream\ReadableIterableStream;
+use Amp\ByteStream\StreamException;
+use Amp\Cancellation;
+use Amp\CancelledException;
+use Amp\DeferredCancellation;
+use Amp\Future;
+use Amp\Http\Client\Connection\DefaultConnectionFactory;
+use Amp\Http\Client\Connection\UnlimitedConnectionPool;
+use Amp\Http\Client\Interceptor\DecompressResponse;
+use Amp\Http\Client\Interceptor\SetRequestHeaderIfUnset;
+use Amp\Http\Client\Interceptor\TooManyRedirectsException;
+use Amp\Http\Client\Support\LocalHttpBin;
+use Amp\Http\Http1\Rfc7230;
+use Amp\PHPUnit\AsyncTestCase;
+use Amp\Pipeline\Pipeline;
+use Amp\Socket\ConnectContext;
+use Amp\Socket\InternetAddress;
+use Amp\Socket\ServerSocket;
+use Amp\Socket\Socket;
+use Amp\Socket\SocketAddress;
+use Amp\Socket\SocketConnector;
+use Revolt\EventLoop;
+use function Amp\async;
+use function Amp\delay;
+use function Amp\Socket\connect;
+use function Amp\Socket\listen;
+
+class ClientHttpBinIntegrationTest extends AsyncTestCase
+{
+    private ServerSocket $socket;
+
+    private HttpClient $client;
+
+    private HttpClientBuilder $builder;
+
+    private LocalHttpBin $httpBin;
+
+    private ?\Closure $responseCallback = null;
+
+    private ?string $rawHandler = null;
+
+    public function testHttp10Response(): void
+    {
+        $this->givenRawServerResponse("HTTP/1.0 200 OK\r\n\r\n");
+
+        $request = $this->createRequest();
+        $request->setProtocolVersions(["1.0"]);
+        $response = $this->executeRequest($request);
+
+        self::assertSame("", $response->getBody()->buffer());
+    }
+
+    public function testCloseAfterConnect(): void
+    {
+        $this->givenRawServerResponse("");
+
+        $this->expectException(SocketException::class);
+        $this->expectExceptionMessageMatches("(Receiving the response headers for '.*' failed, because the socket to '.*' @ '.*' closed early)");
+
+        $request = $this->createRequest();
+        $request->setProtocolVersions(["1.0"]);
+        $this->executeRequest($request);
+    }
+
+    public function testIncompleteHttpResponseWithContentLength(): void
+    {
+        $this->givenRawServerResponse("HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\n.");
+
+        $this->expectException(StreamException::class);
+        $this->expectExceptionMessage("Socket disconnected prior to response completion");
+
+        $request = $this->createRequest();
+        $request->setProtocolVersions(["1.0"]);
+
+        $response = $this->executeRequest($request);
+        $response->getBody()->buffer();
+    }
+
+    public function testIncompleteHttpResponseWithChunkedEncoding(): void
+    {
+        $this->givenRawServerResponse("HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r"); // missing \n
+
+        $this->expectException(StreamException::class);
+        $this->expectExceptionMessage("Socket disconnected prior to response completion");
+
+        $request = $this->createRequest();
+        $request->setProtocolVersions(["1.0"]);
+
+        $response = $this->executeRequest($request);
+        $response->getBody()->buffer();
+    }
+
+    public function testIncompleteHttpResponseWithoutChunkedEncodingAndWithoutContentLength(): void
+    {
+        $this->givenRawServerResponse("HTTP/1.1 200 OK\r\n\r\n00000000000");
+
+        $request = $this->createRequest();
+        $request->setProtocolVersions(["1.0"]);
+
+        $response = $this->executeRequest($request);
+        $body = $response->getBody()->buffer();
+
+        self::assertSame('00000000000', $body);
+    }
+
+    public function testDuplicateContentLengthHeader(): void
+    {
+        $this->givenRawServerResponse("HTTP/1.1 200 OK\r\ncontent-length: 1\r\ncontent-length: 2\r\n\r\n\r\n\r\n\r\n");
+
+        $this->expectException(ParseException::class);
+
+        $this->executeRequest($this->createRequest());
+    }
+
+    public function testInvalidContentLengthHeader(): void
+    {
+        $this->givenRawServerResponse("HTTP/1.1 200 OK\r\ncontent-length: foobar\r\n\r\n\r\n\r\n\r\n");
+
+        $this->expectException(ParseException::class);
+
+        $this->executeRequest($this->createRequest());
+    }
+
+    public function testFoldedHeader(): void
+    {
+        $this->givenRawServerResponse("HTTP/1.1 200 OK\r\ncontent-length: 0\r\nfoo: hello\r\n world\r\n\r\n");
+
+        $response = $this->executeRequest($this->createRequest());
+        $response->getBody()->buffer();
+
+        self::assertSame(['hello world'], $response->getHeaderArray('foo'));
+    }
+
+    public function testInvalidHeaders(): void
+    {
+        $this->givenRawServerResponse("HTTP/1.1 200 OK\r\ncontent-length: 0\r\nfoo\x2f: bar\r\n\r\n");
+
+        $this->expectException(ParseException::class);
+
+        $this->executeRequest($this->createRequest());
+    }
+
+    public function testDefaultUserAgentSent(): void
+    {
+        $uri = $this->httpBin->getServerUri('/user-agent');
+
+        $response = $this->executeRequest(new Request($uri));
+
+        self::assertInstanceOf(Response::class, $response);
+
+        $body = $response->getBody()->buffer();
+        $result = \json_decode($body, true);
+
+        self::assertSame('amphp/http-client/5.x', $result['user-agent']);
+    }
+
+    public function testDefaultUserAgentCanBeChanged(): void
+    {
+        $uri = $this->httpBin->getServerUri('/user-agent');
+
+        $this->givenNetworkInterceptor(new SetRequestHeaderIfUnset('user-agent', 'amphp/http-client'));
+
+        $response = $this->executeRequest(new Request($uri));
+
+        self::assertInstanceOf(Response::class, $response);
+
+        $body = $response->getBody()->buffer();
+        $result = \json_decode($body, true);
+
+        self::assertSame('amphp/http-client', $result['user-agent']);
+    }
+
+    public function testHeaderCase(): void
+    {
+        $this->responseCallback = static function (Socket $socket): void {
+            $buffer = '';
+
+            while (null !== $chunk = $socket->read()) {
+                $buffer .= $chunk;
+
+                if (\str_contains($buffer, "\r\n\r\n")) {
+                    break;
+                }
+            }
+
+            $headers = \explode("\r\n", \trim($buffer));
+            \array_shift($headers);
+
+            $buffer = \json_encode(Rfc7230::parseHeaderPairs(\implode("\r\n", $headers) . "\r\n"));
+
+            $socket->write("HTTP/1.0 200 OK\r\n\r\n$buffer");
+        };
+
+        $request = $this->createRequest();
+        $request->setHeader('tEst', 'test');
+
+        $response = $this->executeRequest($request);
+
+        $body = $response->getBody()->buffer();
+        $result = \json_decode($body, true);
+
+        self::assertSame([
+            ['tEst', 'test'],
+            ['accept', '*/*'],
+            ['user-agent', 'amphp/http-client/5.x'],
+            ['Accept-Encoding', 'gzip, deflate, identity'],
+            ['host', (string) $this->socket->getAddress()],
+        ], $result);
+    }
+
+    public function testHttp2Push(): void
+    {
+        $eventListener = $this->createMock(EventListener::class);
+        $eventListener->expects($this->exactly(2))->method('requestStart');
+        $eventListener->expects($this->exactly(2))->method('requestEnd');
+        $eventListener->expects($this->exactly(1))->method('push');
+
+        $this->builder = $this->builder->usingPool(new UnlimitedConnectionPool(LocalHttpBin::untrustedConnectionFactory()));
+        $this->givenEventListener($eventListener);
+
+        $httpsBin = LocalHttpBin::startSecureServer();
+
+        $request = new Request($httpsBin->getServerUri('/push'));
+        $request->setPushHandler(static function (Request $request, Future $response) use (
+            &$path,
+            &$contentType,
+            &$future,
+            &$pushedRequest
+        ): void {
+            $future = $response;
+            $pushedRequest = $request;
+
+            $path = $request->getUri()->getPath();
+            $contentType = $response->await()->getHeader('content-type');
+        });
+
+        try {
+            $response = $this->executeRequest($request);
+            $response->getBody()->buffer();
+
+            /** @var Response $pushedResponse */
+            $pushedResponse = $future->await();
+            $pushedResponse->getTrailers()->await();
+        } finally {
+            $httpsBin->stopServer();
+        }
+
+        self::assertSame('/text.txt', $path);
+        self::assertSame('text/plain', $contentType);
+    }
+
+    public function testGzipBomb(): void
+    {
+        $response = $this->client->request(new Request($this->httpBin->getServerUri('/gzip-bomb')));
+
+        $this->expectException(StreamException::class);
+
+        $this->expectExceptionMessageMatches('(Configured body size exceeded: \d+ bytes received, while the configured limit is 10485760 bytes)');
+
+        $response->getBody()->buffer();
+    }
+
+    public function testCustomUserAgentSentIfAssigned(): void
+    {
+        $uri = $this->httpBin->getServerUri('/user-agent');
+        $customUserAgent = 'test-user-agent';
+
+        $request = new Request($uri);
+        $request->setHeader('User-Agent', $customUserAgent);
+        $request->setHeader('Connection', 'keep-alive');
+
+        $response = $this->executeRequest($request);
+
+        self::assertInstanceOf(Response::class, $response);
+
+        $body = $response->getBody()->buffer();
+        $result = \json_decode($body, true);
+
+        self::assertSame($customUserAgent, $result['user-agent']);
+    }
+
+    public function testPostStringBody(): void
+    {
+        $body = 'zanzibar';
+        $request = new Request($this->httpBin->getServerUri('/post'));
+        $request->setMethod('POST');
+        $request->setBody($body);
+
+        $response = $this->executeRequest($request);
+
+        self::assertInstanceOf(Response::class, $response);
+
+        $result = \json_decode($response->getBody()->buffer(), true);
+
+        self::assertEquals($body, $result['data']);
+    }
+
+    public function testPutStringBody(): void
+    {
+        $uri = $this->httpBin->getServerUri('/put');
+
+        $body = 'zanzibar';
+        $request = new Request($uri, "PUT");
+        $request->setBody($body);
+
+        $response = $this->executeRequest($request);
+
+        self::assertInstanceOf(Response::class, $response);
+
+        $result = \json_decode($response->getBody()->buffer(), true);
+
+        self::assertEquals($body, $result['data']);
+    }
+
+    /**
+     * @dataProvider provideStatusCodes
+     *
+     * @throws \Throwable
+     */
+    public function testStatusCodeResponses($statusCode): void
+    {
+        $response = $this->executeRequest(new Request($this->httpBin->getServerUri("/status/{$statusCode}")));
+
+        self::assertInstanceOf(Response::class, $response);
+        self::assertEquals($statusCode, $response->getStatus());
+    }
+
+    public function provideStatusCodes(): array
+    {
+        return [
+            [200],
+            [400],
+            [404],
+            [500],
+        ];
+    }
+
+    public function testReason(): void
+    {
+        $this->givenRawServerResponse("HTTP/1.1 418 I'M A TEAPOT\r\ncontent-length: 0\r\n\r\n");
+
+        $response = $this->executeRequest($this->createRequest());
+
+        self::assertInstanceOf(Response::class, $response);
+
+        $expectedReason = "I'M A TEAPOT";
+        $actualReason = $response->getReason();
+
+        self::assertSame($expectedReason, $actualReason);
+    }
+
+    public function testHttp2TeHeader(): void
+    {
+        $this->client = $this->builder->followRedirects(0)->build();
+
+        $request = new Request($this->httpBin->getServerUri('/post'), 'POST');
+        $request->setBody('foobar');
+        $request->setProtocolVersions(['2']);
+        $request->setHeader('te', 'gzip');
+
+        $response = $this->executeRequest($request);
+
+        $this->assertSame(200, $response->getStatus());
+        $this->assertSame($response, $response->getOriginalResponse());
+    }
+
+    public function testRedirect(): void
+    {
+        $this->client = $this->builder->followRedirects(0)->build();
+
+        $this->givenRawServerResponse("HTTP/1.1 302 OK\r\nLocation: https://example.org/\r\n\r\n.");
+
+        $response = $this->executeRequest($this->createRequest());
+
+        self::assertInstanceOf(Response::class, $response);
+        self::assertSame(302, $response->getStatus());
+        self::assertSame($response, $response->getOriginalResponse());
+    }
+
+    public function testRedirectWithFollow(): void
+    {
+        $this->client = $this->builder->followRedirects()->build();
+
+        $this->givenRawServerResponse("HTTP/1.1 302 OK\r\nLocation: {$this->httpBin->getServerUri('/')}\r\n\r\n.");
+
+        $response = $this->executeRequest($this->createRequest());
+
+        self::assertInstanceOf(Response::class, $response);
+        self::assertSame(200, $response->getStatus());
+        self::assertSame(302, $response->getOriginalResponse()->getStatus());
+    }
+
+    public function testClientAddsZeroContentLengthHeaderForEmptyBodiesOnPost(): void
+    {
+        $uri = $this->httpBin->getServerUri('/post');
+
+        $request = new Request($uri);
+        $request->setMethod('POST');
+
+        $response = $this->executeRequest($request);
+
+        self::assertInstanceOf(Response::class, $response);
+
+        $body = $response->getBody()->buffer();
+        $result = \json_decode($body, true);
+
+        self::assertEquals('0', $result['headers']['content-length']);
+    }
+
+    public function testFormEncodedBodyRequest(): void
+    {
+        $body = new Form;
+        $field1 = 'test val';
+        $field2 = 'val2';
+        $body->addField('field1', $field1);
+        $body->addField('field2', $field2);
+
+        $request = new Request($this->httpBin->getServerUri('/post'), "POST");
+        $request->setBody($body);
+
+        $response = $this->executeRequest($request);
+
+        self::assertInstanceOf(Response::class, $response);
+
+        $result = \json_decode($response->getBody()->buffer(), true);
+
+        self::assertEquals($field1, $result['form']['field1']);
+        self::assertEquals($field2, $result['form']['field2']);
+        self::assertEquals('application/x-www-form-urlencoded', $result['headers']['content-type']);
+    }
+
+    public function testFileBodyRequest(): void
+    {
+        $uri = $this->httpBin->getServerUri('/post');
+
+        $bodyPath = __DIR__ . '/fixture/answer.txt';
+        $body = StreamedContent::fromFile($bodyPath);
+
+        $request = new Request($uri, "POST");
+        $request->setBody($body);
+
+        $response = $this->executeRequest($request);
+
+        self::assertInstanceOf(Response::class, $response);
+
+        $result = \json_decode($response->getBody()->buffer(), true);
+
+        self::assertStringEqualsFile($bodyPath, $result['data']);
+    }
+
+    public function testMultipartBodyRequest(): void
+    {
+        $field1 = 'test val';
+        $file1 = __DIR__ . '/fixture/lorem.txt';
+        $file2 = __DIR__ . '/fixture/answer.txt';
+
+        $boundary = 'AaB03x';
+
+        $body = new Form($boundary);
+        $body->addField('field1', $field1);
+        $body->addFile('file1', $file1);
+        $body->addFile('file2', $file2);
+
+        $request = new Request($this->httpBin->getServerUri('/post'), "POST");
+        $request->setBody($body);
+
+        $response = $this->executeRequest($request);
+
+        self::assertEquals(200, $response->getStatus());
+
+        $result = \json_decode($response->getBody()->buffer(), true);
+
+        self::assertEquals($field1, $result['form']['field1']);
+        self::assertStringEqualsFile($file1, $result['files']['file1']);
+        self::assertStringEqualsFile($file2, $result['files']['file2']);
+        self::assertEquals('multipart/form-data; boundary=' . $boundary, $result['headers']['content-type']);
+    }
+
+    /**
+     * @requires extension zlib
+     */
+    public function testGzipResponse(): void
+    {
+        $this->givenNetworkInterceptor(new DecompressResponse);
+
+        $response = $this->executeRequest(new Request($this->httpBin->getServerUri('/gzip')));
+
+        self::assertEquals(200, $response->getStatus());
+
+        $result = \json_decode($response->getBody()->buffer(), true);
+
+        self::assertTrue($result['gzipped']);
+        self::assertFalse($response->hasHeader('content-encoding'));
+    }
+
+    /**
+     * @requires extension zlib
+     */
+    public function testDeflateResponse(): void
+    {
+        $this->givenNetworkInterceptor(new DecompressResponse);
+
+        $response = $this->executeRequest(new Request($this->httpBin->getServerUri('/deflate')));
+
+        self::assertEquals(200, $response->getStatus());
+
+        $result = \json_decode($response->getBody()->buffer(), true);
+
+        self::assertTrue($result['deflated']);
+    }
+
+    public function testInfiniteRedirect(): void
+    {
+        $this->builder->followRedirects(10);
+
+        $request = $this->createRequest();
+        $request->setUri($request->getUri()->withPath('/redirect/11'));
+
+        $this->givenRawServerResponse("HTTP/1.1 302 OK\r\nLocation: /redirect/11\r\n\r\n.");
+
+        $this->expectException(TooManyRedirectsException::class);
+
+        $this->executeRequest($request);
+    }
+
+    public function testConnectShortCircuitIfOtherConnectionBecomesAvailable(): void
+    {
+        $this->setTimeout(3);
+        $this->givenSlowRawServerResponse(1, "HTTP/1.1 204 No content\r\n\r\n", "HTTP/1.1 204 No content\r\n\r\n", "");
+
+        $this->builder = $this->builder->usingPool(new UnlimitedConnectionPool(new DefaultConnectionFactory(new class implements SocketConnector {
+            public function connect(SocketAddress|string $uri, ?ConnectContext $context = null, ?Cancellation $cancellation = null): Socket
+            {
+                static $i = 0;
+
+                if (++$i === 2) {
+                    delay(4);
+                }
+
+                return connect($uri, $context, $cancellation);
+            }
+        })));
+
+        $this->client = $this->builder->build();
+
+        $async1 = async($this->executeRequest(...), $this->createRequest());
+        $async2 = async($this->executeRequest(...), $this->createRequest());
+
+        $async1->await();
+        $async2->await();
+
+        $this->expectNotToPerformAssertions();
+    }
+
+    public function testRequestCancellation(): void
+    {
+        $this->givenSlowRawServerResponse(
+            0.1,
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 1000\r\n\r\n",
+            ...\array_fill(0, 1000, '.')
+        );
+
+        $cancellationTokenSource = new DeferredCancellation;
+        $response = $this->executeRequest($this->createRequest(), $cancellationTokenSource->getCancellation());
+        $cancellationTokenSource->cancel();
+        $this->expectException(CancelledException::class);
+
+        $response->getBody()->buffer();
+    }
+
+    public function testContentLengthBodyMismatchWithTooManyBytesSimple(): void
+    {
+        $this->expectException(InvalidRequestException::class);
+        $this->expectExceptionMessage("Body contained more bytes than specified in Content-Length, aborting request");
+
+        $request = new Request($this->httpBin->getServerUri('/post'), "POST");
+        $request->setBody(StreamedContent::fromStream(new ReadableBuffer("foo"), 1));
+
+        $this->executeRequest($request);
+    }
+
+    public function testContentLengthBodyMismatchWithTooManyBytesWith3ByteChunksAndLength2(): void
+    {
+        $this->expectException(InvalidRequestException::class);
+        $this->expectExceptionMessage("Body contained more bytes than specified in Content-Length, aborting request");
+
+        $request = new Request($this->httpBin->getServerUri('/post'), "POST");
+        $request->setBody(StreamedContent::fromStream(new ReadableIterableStream(
+            Pipeline::fromIterable(["a", "b", "c"])->delay(0.5)
+        ), 2));
+
+        $this->executeRequest($request);
+    }
+
+    public function testContentLengthBodyMismatchWithTooFewBytes(): void
+    {
+        $this->expectException(InvalidRequestException::class);
+        $this->expectExceptionMessage("Body contained fewer bytes than specified in Content-Length, aborting request");
+
+        $request = new Request($this->httpBin->getServerUri('/post'), "POST");
+        $request->setBody(StreamedContent::fromStream(new ReadableBuffer("foo"), 42));
+
+        $this->executeRequest($request);
+    }
+
+    public function testHttp2SupportLargeResponseBody(): void
+    {
+        $this->client = $this->builder->usingPool(new UnlimitedConnectionPool(LocalHttpBin::untrustedConnectionFactory()))->build();
+
+        $httpsBin = LocalHttpBin::startSecureServer();
+
+        $request = new Request($httpsBin->getServerUri('/bytes/3000000'), 'GET');
+        $request->setTransferTimeout(100);
+        $request->setBodySizeLimit(10000000000);
+
+        try {
+            $response = $this->client->request($request);
+            $body = $response->getBody()->buffer();
+        } finally {
+            $httpsBin->stopServer();
+        }
+
+        self::assertSame(200, $response->getStatus());
+        self::assertSame('2', $response->getProtocolVersion());
+        self::assertSame(3000000, \strlen($body));
+    }
+
+    public function testHttp2UpgradeResponse(): void
+    {
+        $request = new Request($this->httpBin->getServerUri('/'));
+        $request->setHeader('connection', 'upgrade, http2-settings');
+        $request->setHeader('upgrade', 'h2c');
+        $request->setHeader('http2-settings', 'AAMAAABkAARAAAAAAAIAAAAA');
+
+        $this->expectException(HttpException::class);
+        $this->expectExceptionMessage('CONNECT or upgrade request made without upgrade handler callback');
+
+        $this->executeRequest($request);
+    }
+
+    public function testHttp2PriorKnowledge(): void
+    {
+        $request = new Request($this->httpBin->getServerUri('/'));
+        $request->setProtocolVersions(['2']);
+
+        $response = $this->executeRequest($request);
+
+        self::assertSame(200, $response->getStatus());
+        self::assertSame('2', $response->getProtocolVersion());
+    }
+
+    public function testHttp2PriorKnowledgeUnsupported(): void
+    {
+        $this->givenRawServerResponse('');
+
+        $request = $this->createRequest();
+        $request->setProtocolVersions(['2']);
+
+        $this->expectException(SocketException::class);
+        $this->expectExceptionMessage('Connection closed before HTTP/2 settings could be received');
+
+        $this->executeRequest($request);
+    }
+
+    public function testNoMemoryLeak(): void
+    {
+        for ($i = 0; $i < 3; $i++) {
+            $client = (new HttpClientBuilder())->build();
+
+            $request = new Request($this->httpBin->getServerUri('/'));
+
+            $response = $client->request($request);
+            $response->getBody()->buffer();
+
+            \gc_collect_cycles();
+            \gc_mem_caches();
+
+            $initialIdentifierCount ??= \count(EventLoop::getIdentifiers());
+            $identifierCount = \count(EventLoop::getIdentifiers());
+
+            self::assertLessThanOrEqual(1, $identifierCount - $initialIdentifierCount);
+        }
+    }
+
+    public function tearDown(): void
+    {
+        parent::tearDown();
+
+        $this->httpBin->stopServer();
+
+        if (isset($this->rawHandler)) {
+            EventLoop::cancel($this->rawHandler);
+        }
+    }
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        $this->builder = (new HttpClientBuilder)->retry(0);
+        $this->client = $this->builder->build();
+
+        $this->httpBin = LocalHttpBin::startInsecureServer();
+
+        $this->socket = listen(new InternetAddress('127.0.0.1', 0));
+        $this->socket->unreference();
+
+        $this->rawHandler = EventLoop::onReadable($this->socket->getResource(), function () {
+            $client = $this->socket->accept();
+
+            if ($client === null) {
+                return;
+            }
+
+            $client->unreference();
+
+            if (!$this->responseCallback) {
+                $this->fail("No response callback set");
+            }
+
+            ($this->responseCallback)($client);
+        });
+    }
+
+    private function givenRawServerResponse(string $response): void
+    {
+        $this->responseCallback = static function ($socket) use ($response): void {
+            $buffer = '';
+
+            // Await request before sending response
+            while (null !== $chunk = $socket->read()) {
+                $buffer .= $chunk;
+
+                if (\str_contains($buffer, "\r\n\r\n")) {
+                    break;
+                }
+            }
+
+            $socket->write($response);
+        };
+    }
+
+    private function givenSlowRawServerResponse(float $delay, string ...$chunks): void
+    {
+        $this->responseCallback = static function (Socket $socket) use ($delay, $chunks): void {
+            try {
+                foreach ($chunks as $chunk) {
+                    delay($delay);
+                    $socket->write($chunk);
+                }
+            } catch (StreamException) {
+                // ignore
+            }
+        };
+    }
+
+    private function executeRequest(Request $request, ?Cancellation $cancellation = null): Response
+    {
+        return $this->client->request($request, $cancellation);
+    }
+
+    private function createRequest(): Request
+    {
+        return new Request('http://' . $this->socket->getAddress());
+    }
+
+    private function givenEventListener(EventListener $eventListener): void
+    {
+        $this->builder = $this->builder->listen($eventListener);
+        $this->client = $this->builder->build();
+    }
+
+    private function givenNetworkInterceptor(NetworkInterceptor $interceptor): void
+    {
+        $this->builder = $this->builder->interceptNetwork($interceptor);
+        $this->client = $this->builder->build();
+    }
+}

@@ -1,0 +1,182 @@
+{
+    "name": "danog/madelineproto",
+    "description": "Async PHP client API for the telegram MTProto protocol.",
+    "type": "library",
+    "license": "AGPL-3.0-only",
+    "homepage": "https://docs.madelineproto.xyz",
+    "keywords": [
+        "telegram",
+        "mtproto",
+        "protocol",
+        "bytes",
+        "messenger",
+        "client",
+        "PHP",
+        "video",
+        "stickers",
+        "audio",
+        "files",
+        "GB"
+    ],
+    "conflict": {
+        "krakjoe/pthreads-polyfill": "*",
+        "ext-pthreads": "*"
+    },
+    "require": {
+        "php-64bit": ">=8.2",
+        "danog/primemodule": "^1.0.13",
+        "symfony/polyfill-mbstring": ">=1.38.2",
+        "ext-json": "*",
+        "ext-xml": "*",
+        "ext-dom": "*",
+        "ext-filter": "*",
+        "ext-hash": "*",
+        "ext-zlib": "*",
+        "ext-fileinfo": "*",
+        "amphp/amp": "^3.1.3",
+        "amphp/http-client": "^5.3.6",
+        "amphp/websocket-client": "^2.0.2",
+        "amphp/http": "^2.1.2",
+        "amphp/socket": "^2.4.1",
+        "amphp/dns": "^2.4.1",
+        "amphp/byte-stream": "^2.1.2",
+        "amphp/file": "^3.2.0",
+        "amphp/mysql": "^3.1.1",
+        "amphp/postgres": "^2.2.1",
+        "amphp/process": "^2.1",
+        "danog/dns-over-https": "^1.0.1",
+        "amphp/http-client-cookies": "^2",
+        "danog/tg-file-decoder": "^1.0.2",
+        "league/uri": "^7.8.1",
+        "danog/ipc": "^1.1.1",
+        "amphp/log": "^2",
+        "danog/loop": "^1.1.1",
+        "phpseclib/phpseclib": "^4.0.1",
+        "amphp/redis": "^2.0.4",
+        "psr/http-factory": "^1.1.0",
+        "psr/log": "^3.0.2",
+        "webmozart/assert": "^2.4.1",
+        "bacon/bacon-qr-code": "^3.1.1",
+        "nikic/php-parser": "^5.9.0",
+        "revolt/event-loop": "^1.0.9",
+        "danog/async-orm": "^1.2.1",
+        "danog/telegram-entities": "^1.1.1",
+        "danog/better-prometheus": "^0.1.1",
+        "amphp/http-server": "^3.4.6",
+        "danog/tg-dialog-id": "^2",
+        "symfony/polyfill-php83": "^1.41",
+        "danog/php-rtc-av": "^1.1.11",
+        "danog/php-rtc-codecs": "^1.1.20",
+        "danog/php-rtc-dtls": "^2.0.22",
+        "danog/php-rtc-ice": "^2.0.19",
+        "danog/php-rtc-ntp": "^1.1.16",
+        "danog/php-rtc-rtcp": "^1.1.11",
+        "danog/php-rtc-rtp": "^2.0.26",
+        "danog/php-rtc-sctp": "^2.0.16",
+        "danog/php-rtc-srtp": "^1.1.18",
+        "danog/php-rtc-stun": "^2.0.19",
+        "danog/php-rtc-webrtc": "^2.0.19",
+        "danog/php-rtc-datachannel": "^1.1.10",
+        "danog/php-rtc-sdp": "^1.1.12",
+        "danog/php-rtc-stats": "^1.1.8",
+        "danog/php-rtc-turn": "^2.0.10",
+        "danog/php-rtc-mdns": "^1.1.12",
+        "danog/php-rtc-exception": "^1.1.10",
+        "danog/php-rtc-mixin": "^2.0.9",
+        "danog/php-rtc-rtp-parameter": "^1.1.8",
+        "symfony/polyfill-iconv": "^1.37",
+        "symfony/polyfill-php84": "^1.38",
+        "symfony/polyfill-php85": "^1.41",
+        "symfony/polyfill-php86": "^1.41"
+    },
+    "require-dev": {
+        "ext-ctype": "*",
+        "danog/phpdoc": "^0.1.24",
+        "phpunit/phpunit": "^9.6.36",
+        "amphp/phpunit-util": "^3",
+        "bamarni/composer-bin-plugin": "1.9.1",
+        "symfony/yaml": "^6.4.45",
+        "dg/bypass-finals": "dev-master",
+        "brianium/paratest": "^6.11.1",
+        "vimeo/psalm": "dev-master",
+        "sebastian/diff": "^4.0.6"
+    },
+    "suggest": {
+        "ext-madeline_crypto": "MadelineCrypto 0.6+ (pie install danog/madelinecrypto), optional Rust acceleration: auth key factorization, AES-IGE and MTProto v2 transport decoding off the PHP thread, and per-packet AES-GCM/CTR/CBC, hashes and HMAC",
+        "ext-ffi": "Install FFI with libcrypto for the AES-IGE fallback, and with libopus, libvpx and ffmpeg for realtime audio/video transcoding; not required to play and record video and audio inside calls",
+        "ext-pdo": "Install the pdo extension to store session data on MySQL",
+        "ext-openssl": "Install the openssl extension for faster crypto",
+        "ext-sodium": "Install the sodium extension for faster crypto",
+        "ext-uv": "Install the uv extension to greatly speed up MadelineProto!",
+        "ext-gmp": "Install the gmp extension to speed up authorization",
+        "ext-bcmath": "Install the bcmath extension to speed up authorization",
+        "ext-sockets": "Install the sockets extension on Windows to use UNIX sockets for IPC (otherwise TCP on 127.0.0.1 is used, which any local user can connect to)"
+    },
+    "authors": [
+        {
+            "name": "Daniil Gentili",
+            "email": "daniil@daniil.it"
+        }
+    ],
+    "autoload": {
+        "psr-4": {
+            "danog\\MadelineProto\\": "src"
+        },
+        "files": [
+            "src/polyfill.php"
+        ]
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "danog\\MadelineProto\\Test\\": "tests/danog/MadelineProto",
+            "danog\\MadelineProto\\": "tools/"
+        },
+        "files": [
+            "tools/build_docs/schemas.php",
+            "tools/build_docs/merge.php",
+            "tools/build_docs/layerUpgrade.php"
+        ]
+    },
+    "scripts": {
+        "build": [
+            "@docs",
+            "@docs-fix",
+            "@cs-fix",
+            "@fuzz",
+            "@file_ref_map",
+            "@test-light"
+        ],
+        "test": [
+            "@paratest",
+            "@test-session"
+        ],
+        "test-light": [
+            "@paratest-light"
+        ],
+        "cs-fix": "PHP_CS_FIXER_IGNORE_ENV=1 php -d pcre.jit=0 vendor/bin/php-cs-fixer fix -v",
+        "psalm": "psalm --no-cache --threads=10",
+        "docs": "php tools/build_docs.php",
+        "fuzz": "php tools/fuzzer.php",
+        "file_ref_map": "php tools/gen_filerefmap.php",
+        "file_ref_map_docs": "php tools/gen_filerefmap_docs.php",
+        "docs-fix": "tools/fix_docs.sh",
+        "paratest": "@php -dzend.assertions=1 ./vendor/bin/paratest -v --exclude-group session",
+        "test-session": "tests/session_tests.sh",
+        "paratest-light": "@php -dzend.assertions=1 ./vendor/bin/paratest -vc phpunit-light.xml --exclude-group session",
+        "bin": "echo 'bin not installed'",
+        "post-install-cmd": [
+            "@composer bin all install --ansi"
+        ],
+        "post-update-cmd": [
+            "@composer bin all update --ansi"
+        ]
+    },
+    "config": {
+        "allow-plugins": {
+            "bamarni/composer-bin-plugin": true,
+            "phabel/phabel": true,
+            "dealerdirect/phpcodesniffer-composer-installer": true,
+            "symfony/thanks": true
+        }
+    }
+}

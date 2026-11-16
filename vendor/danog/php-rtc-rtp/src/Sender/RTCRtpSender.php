@@ -1,0 +1,1053 @@
+<?php
+
+/**
+ * This file is part of the PHP WebRTC package.
+ *
+ * (c) Amin Yazdanpanah <https://www.aminyazdanpanah.com/#contact>
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Webrtc\RTP\Sender;
+
+use Exception;
+use Psr\Log\LoggerInterface;
+use Ramsey\Uuid\Uuid;
+use Random\RandomException;
+use Revolt\EventLoop;
+use Throwable;
+use Webrtc\AVCodec\Frame\AudioFrame;
+use Webrtc\AVCodec\Frame\FrameInterface;
+use Webrtc\Codecs\Codec;
+use Webrtc\Codecs\EncodedPacket;
+use Webrtc\Codecs\CodecUtility;
+use Webrtc\Codecs\EncoderInterface;
+use Webrtc\Exception\InvalidArgumentException;
+use Webrtc\Mixin\SerializableState;
+use Webrtc\NTP\NetworkTimeProtocol;
+use Webrtc\RTCP\Exception\RtcpExceptionInterface;
+use Webrtc\RTCP\RtcpByePacket;
+use Webrtc\RTCP\RtcpConstants;
+use Webrtc\RTCP\RtcpPacketInterface;
+use Webrtc\RTCP\RtcpPsfbPacket;
+use Webrtc\RTCP\RtcpRrPacket;
+use Webrtc\RTCP\RtcpRtpfbPacket;
+use Webrtc\RTCP\RtcpSdesPacket;
+use Webrtc\RTCP\RtcpSenderInfo;
+use Webrtc\RTCP\RtcpSourceInfo;
+use Webrtc\RTCP\RtcpSrPacket;
+use Webrtc\RTP\Enum\MediaKind;
+use Webrtc\RTP\RtpComponentLogger;
+use Webrtc\RTP\HeaderExtension\HeaderExtensions;
+use Webrtc\RTP\HeaderExtension\HeaderExtensionsMap;
+use Webrtc\RTP\MediaStreamTrack\MediaStreamTrack;
+use Webrtc\RTP\MediaStreamTrack\MediaStreamTrackSink;
+use Webrtc\RTP\RTCRTPDtlsTransportInterface;
+use Webrtc\RTP\RtpConstants;
+use Webrtc\RTP\RtpUtility;
+use Webrtc\RTP\TransportSequenceNumbers;
+use Webrtc\RTPParameter\RTCRtpCodecParameters;
+use Webrtc\RTPParameter\RTCRtpSendParameters;
+use Webrtc\Stats\enum\StatType;
+use Webrtc\Stats\enum\TLSState;
+use Webrtc\Stats\RTCOutboundRtpStreamStats;
+use Webrtc\Stats\RTCRemoteInboundRtpStreamStats;
+use Webrtc\Stats\RTCStatsReport;
+
+/**
+ * RTCRtpSender handles the sending of media data over RTP/RTCP.
+ *
+ * This class is responsible for:
+ * - Encoding and packetizing media frames
+ * - Sending RTP packets
+ * - Generating and processing RTCP packets
+ * - Handling retransmissions (RTX)
+ * - Collecting and reporting statistics
+ * - Managing the media track and transport
+ */
+final class RTCRtpSender implements RtpSenderInterface, MediaStreamTrackSink
+{
+    /** @var float Smoothing factor for RTT calculations */
+    private const RTT_ALPHA = 0.85;
+
+    /** @var MediaKind The kind of media (e.g., "audio" or "video") */
+    private MediaKind $kind;
+
+    /** @var MediaStreamTrack|null The media track being sent */
+    private ?MediaStreamTrack $track = null;
+
+    /** @var string|null The CNAME for RTCP */
+    private ?string $cname = null;
+
+    /** @var int The SSRC for RTP */
+    private int $ssrc;
+
+    /** @var int The SSRC for RTX (retransmissions) */
+    private int $rtxSsrc;
+
+    /** @var string The stream ID */
+    private string $streamId;
+
+    /** @var bool Whether the sender is enabled */
+    private bool $enabled = true;
+
+    /**
+     * Loudness, in -dBov, at or below which a packet still counts as carrying speech.
+     *
+     * Used to fill in the voice activity bit of the RFC 6464 audio level extension. Levels are
+     * inverted, so a smaller number is louder and 127 is digital silence; -60dBov is quiet enough
+     * to be inaudible in practice, which makes it a reasonable floor for a sender that has no real
+     * voice activity detector.
+     */
+    private const SILENCE_LEVEL_DBOV = 60;
+
+    /** @var EncoderInterface|null The encoder for media frames */
+    private ?EncoderInterface $encoder = null;
+
+    /** @var bool Whether to force the next frame to be a keyframe */
+    private bool $useKeyframe = false;
+
+    /** @var string|null The media ID (mid) for this sender */
+    private ?string $mid = null;
+
+    /**
+     * The last RTP packets sent, for retransmissions, by sequence number modulo {@see RtpConstants::RTP_HISTORY_SIZE}:
+     * each with the offset of its transport-wide sequence number (null if none), to renumber it.
+     *
+     * @var array<int, array{string, ?int}>
+     */
+    private array $sentRtpPackets = [];
+
+    /** @var RTCStatsReport Statistics for this sender */
+    private RTCStatsReport $stats;
+
+    /** @var float|null The last sender report timestamp */
+    private ?float $lsrTime = null;
+
+    /** @var int|null The last sender report NTP timestamp */
+    private ?int $lsr = null;
+
+    private int $ntpTimestampHigh = 0;
+    private int $ntpTimestampLow = 0;
+
+    /** @var int The RTP timestamp */
+    private int $rtpTimestamp = 0;
+
+    /** @var int The total number of octets sent */
+    private int $octetCount = 0;
+
+    /** @var int The total number of packets sent */
+    private int $packetCount = 0;
+
+    /** @var float|null The round-trip time (RTT) estimate */
+    private ?float $rtt = null;
+
+    /** @var bool Whether the sender has started */
+    private bool $started = false;
+
+    /** @var string The track ID */
+    private string $trackId;
+
+    /** @var HeaderExtensionsMap Map of RTP header extensions */
+    private HeaderExtensionsMap $headerExtensionsMap;
+
+    /** @var int|null The payload type for RTX packets */
+    private ?int $rtxPayloadType = null;
+
+
+
+    /** @var RTCRtpCodecParameters The codec parameters */
+    private RTCRtpCodecParameters $codec;
+
+    /** @var LoggerInterface|null The logger instance */
+    private ?LoggerInterface $logger = null;
+
+    /** Consecutive failed sends, to stop a hopelessly broken sender rather than fail on every frame. */
+    private int $consecutiveSendFailures = 0;
+    /** How many consecutive send failures are tolerated before the sender gives up. */
+    private const MAX_CONSECUTIVE_SEND_FAILURES = 100;
+
+    /** Optional end-to-end frame encryptor; when set, each encoded frame is encrypted before it is sent. */
+    private ?\Webrtc\RTP\Crypto\FrameCryptorInterface $frameCryptor = null;
+    /** Bytes per RTP payload when generically fragmenting an encrypted frame. */
+
+    /** Install (or clear) the end-to-end frame encryptor applied to outgoing frames. */
+    public function setFrameCryptor(?\Webrtc\RTP\Crypto\FrameCryptorInterface $frameCryptor): void
+    {
+        $this->frameCryptor = $frameCryptor;
+    }
+
+    /** @var string Handle of The RTCP timer task */
+    private string $rtcpTask;
+
+    /** @var int The current RTP sequence number */
+    private int $sequenceNumber;
+
+    /** @var int The current RTX sequence number */
+    private int $rtxSequenceNumber;
+
+    /** @var int The original timestamp offset */
+    private int $orgTimestamp;
+
+    /**
+     * Constructs a new RTCRtpSender instance.
+     *
+     * @param MediaKind|MediaStreamTrack $trackOrKind Either a MediaStreamTrack or a media kind ("audio" or "video")
+     * @param RTCRTPDtlsTransportInterface $transport The transport for sending media
+     * @throws InvalidArgumentException If the transport is closed
+     * @throws RandomException If random number generation fails
+     */
+    public function __construct(MediaKind|MediaStreamTrack $trackOrKind, private RTCRTPDtlsTransportInterface $transport)
+    {
+        if ($transport->getState() === TLSState::CLOSED) {
+            throw new InvalidArgumentException("Transport is closed");
+        }
+
+        if ($trackOrKind instanceof MediaStreamTrack) {
+            $this->kind = $trackOrKind->getKind();
+            $this->replaceTrack($trackOrKind);
+        } else {
+            $this->kind = $trackOrKind;
+            $this->replaceTrack(null);
+        }
+
+        $this->ssrc = random_int(0, 0xFFFFFFFF);
+        $this->rtxSsrc = random_int(0, 0xFFFFFFFF);
+        $this->orgTimestamp = random_int(0, 0xFFFFFFFF);
+        $this->sequenceNumber = $this->generateSequenceNumber();
+        $this->rtxSequenceNumber = random_int(0, 0xFFFF);
+        $this->streamId = Uuid::uuid4()->toString();
+        $this->stats = new RTCStatsReport();
+        $this->headerExtensionsMap = new HeaderExtensionsMap();
+        $this->codec = new RTCRtpCodecParameters("", 0);
+        $this->rtcpTask = "";
+    }
+
+    /**
+     * Gets the kind of media for this sender.
+     *
+     * @return MediaKind The media kind ("audio" or "video")
+     */
+    public function getKind(): MediaKind
+    {
+        return $this->kind;
+    }
+
+    /**
+     * Gets the media track being sent.
+     *
+     * @return MediaStreamTrack|null The media track or null if not set
+     */
+    public function getTrack(): ?MediaStreamTrack
+    {
+        return $this->track;
+    }
+
+    /**
+     * Gets the transport used for sending media.
+     *
+     * @return RTCRTPDtlsTransportInterface The transport
+     */
+    public function getTransport(): RTCRTPDtlsTransportInterface
+    {
+        return $this->transport;
+    }
+
+    /**
+     * Replaces the media track being sent.
+     *
+     * @param MediaStreamTrack|null $track The new media track or null to clear
+     */
+    public function replaceTrack(?MediaStreamTrack $track): void
+    {
+        if ($this->started && $this->track !== $track) {
+            $this->track?->setSink(null);
+            $track?->setSink($this);
+        }
+        $this->track = $track;
+        $this->trackId = $track ? $track->getId() : Uuid::uuid4()->toString();
+    }
+
+    /**
+     * Sets the transport used for sending media.
+     *
+     * @param RTCRTPDtlsTransportInterface $transport The new transport
+     */
+    public function setTransport(RTCRTPDtlsTransportInterface $transport): void
+    {
+        $this->transport = $transport;
+    }
+
+    /**
+     * Starts sending media with the given parameters.
+     *
+     * @param RTCRtpSendParameters $parameters The parameters for sending media
+     * @throws RandomException If random number generation fails
+     */
+    #[\Override]
+    public function start(RTCRtpSendParameters $parameters): void
+    {
+        $this->cname = $parameters->rtcp->cname;
+        $this->mid = $parameters->muxId;
+        $this->codec = $parameters->codecs[0];
+        $this->encoder = null;
+        $this->rtxPayloadType = null;
+        $this->transport->setRtpSender($this, $parameters);
+        $this->headerExtensionsMap->configure($parameters);
+
+        foreach ($parameters->codecs as $codec) {
+            if (CodecUtility::isRtx($codec) && CodecUtility::apt($codec) === $parameters->codecs[0]->payloadType) {
+                $this->rtxPayloadType = $codec->payloadType;
+                break;
+            }
+        }
+
+        // A connected transceiver may be negotiated again with another codec or payload type.
+        // Keep the running RTP task, but make every packet after this point use the new parameters.
+        if ($this->started) {
+            $this->logger?->debug(" RTP Sender reconfigured");
+            return;
+        }
+
+        // Start RTP and RTCP tasks
+        $this->startRtpTask();
+        $this->startRtcpTask();
+        $this->started = true;
+        $this->logger?->debug(" RTP Sender started");
+    }
+
+    /**
+     * Shuts down RTP and RTCP tasks.
+     */
+    #[\Override]
+    public function stop(): void
+    {
+        $this->shutdown(true);
+    }
+
+    /**
+     * Stops the RTP and RTCP tasks.
+     *
+     * @param bool $bye Whether to tell the peer that the stream ended with an RTCP BYE packet.
+     */
+    private function shutdown(bool $bye): void
+    {
+        if (!$this->started) {
+            return;
+        }
+        $this->started = false;
+
+        $this->transport->removeRtpSender($this);
+
+        // Stop RTCP and RTP Tasks
+        $this->stopRtcpTask($bye);
+        $this->stopRtpTask();
+    }
+
+    /**
+     * Stops the RTCP task, sending a BYE packet if requested.
+     */
+    private function stopRtcpTask(bool $bye): void
+    {
+        EventLoop::cancel($this->rtcpTask);
+        if ($bye) {
+            $byePacket = new RtcpByePacket([$this->ssrc]);
+            $this->sendRtcpPacket([$byePacket]);
+        }
+
+        $this->logger?->debug(" RTCP has ended.");
+    }
+
+    /**
+     * Stops the RTP task and cleans up resources.
+     */
+    private function stopRtpTask(): void
+    {
+        if ($this->track) {
+            $this->track->stop();
+            $this->track = null;
+        }
+        $this->encoder = null;
+        $this->logger?->debug(" RTP has ended.");
+    }
+
+    /**
+     * Starts the periodic RTP packet sending a task.
+     *
+     * @throws RandomException
+     */
+    public function startRtpTask(): void
+    {
+        $this->logger?->debug("Start RTP task");
+        $this->sequenceNumber = $this->generateSequenceNumber();
+        $this->orgTimestamp = random_int(0, 0xFFFFFFFF);
+        if ($this->track === null) {
+            throw new InvalidArgumentException("Cannot start the RTP task without a media track");
+        }
+
+        EventLoop::queue($this->drainRtp(...));
+    }
+
+    /**
+     * Send the frames of the track, see {@see self::onFrame()}.
+     *
+     * Restarted only as the first-class callable `$this->drainRtp(...)` handed to
+     * EventLoop::queue(), including when unserialize re-queues it (once the track was unserialized too).
+     */
+    private function drainRtp(): void
+    {
+        // The sender may be stopped (or its track detached) between queueing and execution, in which
+        // case there is nothing to send yet.
+        if ($this->track === null || !$this->started) {
+            return;
+        }
+        // Held weakly by the track: an unset()+gc can reclaim the sender, stop() (also reached from
+        // __destruct) stops the track.
+        $this->track->setSink($this);
+    }
+
+    /**
+     * Send a frame of the track, as soon as it pushes it.
+     *
+     * @return bool False if the sender stopped sending (it was stopped, its track was detached, or it gave up).
+     */
+    #[\Override]
+    public function onFrame(FrameInterface|EncodedPacket $frame): bool
+    {
+        // The sender may have been stopped or its track detached while iterating: stop pushing media
+        // onto the wire.
+        if ($this->track === null || !$this->started || $this->consecutiveSendFailures >= self::MAX_CONSECUTIVE_SEND_FAILURES) {
+            return false;
+        }
+        // While the sender is paused (e.g. the transceiver direction dropped the
+        // outgoing media, or the track was muted), drain frames off the consumer
+        // without putting anything on the wire. This keeps the encoder from
+        // building up a backlog that would burst out the moment we resume.
+        if (!$this->enabled) {
+            return true;
+        }
+        // A frame failing to go on the wire — a transient socket error, or an SRTP context that
+        // cannot encrypt this packet (e.g. a stale one after a resume) — must never escape as an
+        // uncaught event-loop exception and kill the whole process. Log it (never hide it), drop
+        // the frame, and keep draining; but a fault that recurs on every frame is not transient,
+        // so give up after a bounded number of consecutive failures instead of looping forever —
+        // the higher layer (which watches the connection) can then renegotiate or end the call.
+        try {
+            $this->sendEncodedFrame($frame);
+            $this->consecutiveSendFailures = 0;
+        } catch (Throwable $e) {
+            $this->logger?->error('Failed to send an outgoing RTP frame: '.$e->getMessage());
+            if (++$this->consecutiveSendFailures >= self::MAX_CONSECUTIVE_SEND_FAILURES) {
+                $this->logger?->error(
+                    'Stopping the RTP sender after '.self::MAX_CONSECUTIVE_SEND_FAILURES
+                    .' consecutive send failures; the transport needs to be renegotiated.',
+                );
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Encode (or packetize) one frame from the track consumer and put it on the wire.
+     */
+    private function sendEncodedFrame(FrameInterface|EncodedPacket $data): void
+    {
+        $audioLevel = null;
+        if ($data instanceof EncodedPacket) {
+            $audioLevel = $data->getAudioLevel();
+            if ($this->frameCryptor !== null) {
+                // End-to-end encryption the way WebRTC's encoder-to-packetizer frame transformers do
+                // it: the whole encoded frame is encrypted before packetization and the ciphertext is
+                // then packetized by the codec's own packetizer, so the RTP payload descriptors stay in
+                // the clear and any WebRTC receiver depacketizes it normally (its depacketizer-to-decoder
+                // transformer then decrypts the reassembled frame). The cryptor is responsible for
+                // leaving whatever the packetizer/depacketizer parse of the bitstream unencrypted.
+                try {
+                    $encrypted = $this->frameCryptor->encryptFrame($this->kind, $this->ssrc, $data->getData());
+                } catch (\Webrtc\RTP\Crypto\DropFrameException $e) {
+                    // Not a failure to send: the next frames may go (a frame transformer dropping a frame, too).
+                    $this->logger?->debug('Dropped an outgoing frame: '.$e->getMessage());
+                    return;
+                }
+                $data = new EncodedPacket(
+                    $encrypted,
+                    $data->getTimestamp(),
+                    $data->isKeyframe(),
+                    $audioLevel,
+                );
+            }
+        }
+        if ($data instanceof FrameInterface) {
+            if ($data instanceof AudioFrame) {
+                $audioLevel = RtpUtility::computeAudioLevelDbov($data->getPlanes()[0]->getData(), $data->getSamples());
+            }
+            $useKeyFrame = $this->useKeyframe;
+            $this->useKeyframe = false;
+            $this->encoder ??= Codec::getEncoder($this->codec);
+            $encoded = $this->encoder->encode($data, $useKeyFrame);
+            if (\is_string($encoded)) {
+                throw new InvalidArgumentException("Encoder returned a raw string instead of a payload list");
+            }
+            /** @var array{0: string[], 1: int} $encoded */
+            [$payloads, $timestamp] = $encoded;
+        } else {
+            // pack() handles both EncodedPacket and AVCodec Packet: pre-encoded frames are
+            // passed straight through (still packetized for video), while raw packets have
+            // their timebase converted to the codec's RTP clock.
+            $this->encoder ??= Codec::getEncoder($this->codec);
+            $encoded = $this->encoder->pack($data);
+            if (\is_string($encoded)) {
+                throw new InvalidArgumentException("Encoder returned a raw string instead of a payload list");
+            }
+            /** @var array{0: string[], 1: int} $encoded */
+            [$payloads, $timestamp] = $encoded;
+        }
+
+        if (empty($payloads)) {
+            return;
+        }
+
+        // Raw frames encoded here are packetized straight away: end-to-end encryption of the encoded
+        // frame is only possible for pre-encoded frames (EncodedPacket), see above.
+        if ($this->frameCryptor !== null && $data instanceof FrameInterface) {
+            throw new InvalidArgumentException('End-to-end frame encryption requires pre-encoded frames (EncodedPacket)');
+        }
+
+        if ($this->codec->payloadType === null) {
+            throw new InvalidArgumentException("Cannot generate RTP packet: codec has no payload type");
+        }
+        // The header extensions are the same for every packet of a frame, sent at the same time.
+        [$ntpTimeHigh, $ntpTimeLow] = NetworkTimeProtocol::currentNtpTime();
+        $extensions = new HeaderExtensions();
+        // abs-send-time is a 6.18 fixed point value: bits 14..37 of the raw NTP timestamp.
+        $extensions->setAbsSendTime((($ntpTimeHigh & 0x3F) << 18) | ($ntpTimeLow >> 14));
+        $extensions->setMid($this->mid);
+        if ($audioLevel !== null) {
+            // RFC 6464 carries the loudness as 0..127 in -dBov, 0 being the loudest. Clamp rather
+            // than let an out of range value wrap into a nonsensical one.
+            $level = min(127, max(0, -$audioLevel));
+            // The V bit reports voice activity, and the extension is negotiated with "vad=on"
+            // unless the attribute says otherwise, so a sender that leaves it clear is telling the
+            // receiver it is silent on every single packet. Selective forwarding units use exactly
+            // that to decide whose audio to relay, so anything above the silence floor has to
+            // report activity.
+            $extensions->setAudioLevel([$level <= self::SILENCE_LEVEL_DBOV, $level]);
+        }
+        $transport = $this->transport instanceof TransportSequenceNumbers ? $this->transport : null;
+        [$extensionProfile, $extensionValue, $transportSequenceNumberOffset] = $this->headerExtensionsMap->setForFrame($extensions, $transport !== null);
+        // Version 2, no padding nor CSRCs.
+        $firstByte = 0x80;
+        $extensionHeader = '';
+        if ($extensionValue !== '') {
+            $firstByte |= 0x10;
+            $extensionHeader = pack('n2', $extensionProfile, intdiv(strlen($extensionValue), 4)).$extensionValue;
+        }
+        // Every packet has its own transport-wide sequence number, in between.
+        $afterTransportSequenceNumber = '';
+        if ($transportSequenceNumberOffset !== null) {
+            $afterTransportSequenceNumber = substr($extensionHeader, 4 + $transportSequenceNumberOffset + 2);
+            $extensionHeader = substr($extensionHeader, 0, 4 + $transportSequenceNumberOffset);
+            // Of the whole packet.
+            $transportSequenceNumberOffset += 12 + 4;
+        }
+        $timestamp = ($this->orgTimestamp + $timestamp) & 0xFFFFFFFF;
+        $last = count($payloads) - 1;
+        foreach ($payloads as $i => $payload) {
+            $packet = pack(
+                'CCnNN',
+                $firstByte,
+                ($i === $last ? 0x80 : 0) | $this->codec->payloadType,
+                $this->sequenceNumber,
+                $timestamp,
+                $this->ssrc,
+            ).$extensionHeader;
+            if ($transport !== null && $transportSequenceNumberOffset !== null) {
+                $packet .= pack('n', $transport->nextTransportSequenceNumber()).$afterTransportSequenceNumber;
+            }
+            $packet .= $payload;
+            $this->logger?->debug("Sending packet: seq={$this->sequenceNumber}, ts=$timestamp, ".strlen($packet).' bytes');
+            $this->sentRtpPackets[$this->sequenceNumber % RtpConstants::RTP_HISTORY_SIZE] = [$packet, $transportSequenceNumberOffset];
+            $this->transport->sendRtp($packet);
+            $this->octetCount += strlen($payload);
+            $this->packetCount++;
+            $this->sequenceNumber = ($this->sequenceNumber + 1) & 0xFFFF;
+        }
+        // For the sender reports.
+        $this->ntpTimestampHigh = $ntpTimeHigh;
+        $this->ntpTimestampLow = $ntpTimeLow;
+        $this->rtpTimestamp = $timestamp;
+    }
+
+    /**
+     * Starts the periodic RTCP packet sending a task.
+     *
+     * @throws RandomException If random number generation fails
+     */
+    private function startRtcpTask(): void
+    {
+        $this->logger?->debug("RTCP started");
+
+        // Weak self-reference: a repeat watcher registered as $this->onRtcpTimer(...) would pin
+        // this sender in the event loop forever, so an unset()+gc could never reclaim it. The tick
+        // cancels itself once the owner has been collected.
+        $weak = \WeakReference::create($this);
+        $this->rtcpTask = EventLoop::repeat(0.5 + ((float) random_int(0, 1000) / 1000.0), static function (string $id) use ($weak): void {
+            $self = $weak->get();
+            if ($self === null) {
+                EventLoop::cancel($id);
+
+                return;
+            }
+            $self->onRtcpTimer();
+        });
+    }
+
+    /**
+     * Periodic RTCP tick.
+     *
+     * Scheduled only as the first-class callable `$this->onRtcpTimer(...)` handed to
+     * EventLoop::repeat(), including when the watcher is re-armed after unserialize. That callable
+     * keeps this method's private scope, so it does not need to be public.
+     */
+    private function onRtcpTimer(): void
+    {
+        try {
+            $rtcpPackets = $this->generateRtcpPackets();
+            $this->sendRtcpPacket($rtcpPackets);
+        } catch (RtcpExceptionInterface $e) {
+            $this->logger?->warning("RTCP error: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Generates RTCP packets for the current state.
+     *
+     * @return RtcpPacketInterface[] Array of RTCP packets to send
+     */
+    private function generateRtcpPackets(): array
+    {
+        $packets = [$this->generateRtcpSrPacket()];
+
+        // The LSR field carries the middle 32 bits of the raw NTP timestamp.
+        $this->lsr = (($this->ntpTimestampHigh & 0xFFFF) << 16) | ($this->ntpTimestampLow >> 16);
+        $this->lsrTime = microtime(true);
+
+        // Generate RTCP SDES packet
+        if ($this->cname !== null) {
+            $packets[] = $this->generateRtcpSdesPacket($this->cname);
+        }
+
+        return $packets;
+    }
+
+    /**
+     * Generates an RTCP sender report (SR) packet.
+     *
+     * @return RtcpSrPacket The generated SR packet
+     */
+    private function generateRtcpSrPacket(): RtcpSrPacket
+    {
+        return new RtcpSrPacket(
+            ssrc: $this->ssrc,
+            senderInfo: new RtcpSenderInfo(
+                ntpTimestampHigh: $this->ntpTimestampHigh,
+                ntpTimestampLow: $this->ntpTimestampLow,
+                rtpTimestamp: $this->rtpTimestamp,
+                packetCount: $this->packetCount,
+                octetCount: $this->octetCount
+            )
+        );
+    }
+
+    /**
+     * Generates an RTCP source description (SDES) packet.
+     *
+     * @param string $cname The canonical name (CNAME) to advertise in the SDES item
+     * @return RtcpSdesPacket The generated SDES packet
+     */
+    private function generateRtcpSdesPacket(string $cname): RtcpSdesPacket
+    {
+        return new RtcpSdesPacket([
+            new RtcpSourceInfo(
+                ssrc: $this->ssrc,
+                items: [[1, $cname]]
+            )
+        ]);
+    }
+
+    /**
+     * Sends RTCP packets over the transport.
+     *
+     * @param array<RtcpPacketInterface> $packets The RTCP packets to send
+     */
+    private function sendRtcpPacket(array $packets): void
+    {
+        $payload = "";
+        foreach ($packets as $packet) {
+            $this->logger?->debug("Sending RTCP packet: $packet");
+            $payload .= $packet->encode();
+        }
+
+        try {
+            $this->transport->sendRtcp($payload);
+        } catch (Throwable $e) {
+            $this->logger?->warning("Failed to send RTCP: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Handles an incoming RTCP packet.
+     *
+     * @param RtcpPacketInterface $packet The received RTCP packet
+     * @throws Throwable If there's an error with DTLS
+     */
+    public function handleRtcpPacket(RtcpPacketInterface $packet): void
+    {
+        if ($packet instanceof RtcpRrPacket || $packet instanceof RtcpSrPacket) {
+            $this->handleReportRtcpPacket($packet);
+        } elseif ($packet instanceof RtcpRtpfbPacket && $packet->getFmt() === RtcpConstants::RTCP_RTPFB_NACK) {
+            foreach ($packet->getLost() as $seq) {
+                $this->retransmit($seq);
+            }
+        } elseif ($packet instanceof RtcpPsfbPacket && $packet->getFmt() === RtcpConstants::RTCP_PSFB_PLI) {
+            $this->sendKeyframe();
+        } elseif ($packet instanceof RtcpPsfbPacket && $packet->getFmt() === RtcpConstants::RTCP_PSFB_APP) {
+            $this->changeMediaBitrate($packet);
+        }
+    }
+
+    /**
+     * Handles RTCP report packets (RR or SR).
+     *
+     * @param RtcpSrPacket|RtcpRrPacket $packet The report packet
+     */
+    private function handleReportRtcpPacket(RtcpSrPacket|RtcpRrPacket $packet): void
+    {
+        foreach ($packet->getReports() as $report) {
+            if ($report->getSsrc() !== $this->ssrc) {
+                continue;
+            }
+
+            // Only the round-trip time requires a locally-sent SR for the LSR reference; the
+            // remote-inbound statistics are recorded regardless of whether that reference exists.
+            if ($this->lsrTime !== null) {
+                // Estimate round-trip time
+                $rtt = microtime(true) - $this->lsrTime - ((float) $report->getDlsr() / 65536.0);
+                $this->rtt = $this->rtt === null ? $rtt : self::RTT_ALPHA * $this->rtt + (1.0 - self::RTT_ALPHA) * $rtt;
+            }
+
+            // Update statistics
+            $this->stats->add(new RTCRemoteInboundRtpStreamStats(
+                id: "remote_inbound_rtp_stream_" . spl_object_id($this),
+                ssrc: $packet->getSsrc(),
+                kind: $this->kind->value,
+                transportId: $this->transport->getReportTransport()->id,
+                packetsReceived: $this->packetCount - $report->getPacketsLost(),
+                packetsLost: $report->getPacketsLost(),
+                jitter: $report->getJitter(),
+                roundTripTime: $this->rtt ?? 0.0,
+                fractionLost: (float) $report->getFractionLost()
+            ));
+        }
+    }
+
+    /**
+     * Retransmits an RTP packet identified by sequence number.
+     *
+     * @param int $sequenceNumber The sequence number of the packet to retransmit
+     * @throws RandomException
+     * @throws Throwable
+     */
+    public function retransmit(int $sequenceNumber): void
+    {
+        [$packet, $transportSequenceNumberOffset] = $this->sentRtpPackets[$sequenceNumber % RtpConstants::RTP_HISTORY_SIZE] ?? [null, null];
+        if ($packet === null || ((ord($packet[2]) << 8) | ord($packet[3])) !== $sequenceNumber) {
+            return;
+        }
+        // A retransmission is another packet on the transport (it's in the same place in an RTX one).
+        if ($transportSequenceNumberOffset !== null && $this->transport instanceof TransportSequenceNumbers) {
+            $packet = substr_replace($packet, pack('n', $this->transport->nextTransportSequenceNumber()), $transportSequenceNumberOffset, 2);
+        }
+        if ($this->rtxPayloadType !== null) {
+            // RFC 4588: the same header (and extensions) on the RTX stream, the payload prefixed by
+            // the original sequence number.
+            $headerLength = 12 + 4 * (ord($packet[0]) & 0x0F);
+            if (ord($packet[0]) & 0x10) {
+                $headerLength += 4 + 4 * ((ord($packet[$headerLength + 2]) << 8) | ord($packet[$headerLength + 3]));
+            }
+            $packet = $packet[0]
+                .chr((ord($packet[1]) & 0x80) | $this->rtxPayloadType)
+                .pack('n', $this->rtxSequenceNumber)
+                .substr($packet, 4, 4)
+                .pack('N', $this->rtxSsrc)
+                .substr($packet, 12, $headerLength - 12)
+                .pack('n', $sequenceNumber)
+                .substr($packet, $headerLength);
+            $this->rtxSequenceNumber = ($this->rtxSequenceNumber + 1) & 0xFFFF;
+        }
+
+        $this->logger?->debug("Retransmitting packet: seq=$sequenceNumber");
+        $this->transport->sendRtp($packet);
+    }
+
+    /**
+     * Adjusts media bitrate based on REMB feedback.
+     *
+     * @param RtcpPsfbPacket $packet The REMB feedback packet
+     */
+    private function changeMediaBitrate(RtcpPsfbPacket $packet): void
+    {
+        try {
+            [$bitrate, $ssrcs] = RtpUtility::unpackRembFci($packet->getFci());
+            if (in_array($this->ssrc, $ssrcs)) {
+                $this->logger?->debug("Receiver estimated maximum bitrate: $bitrate bps");
+                $this->encoder?->setBitrate($bitrate);
+            }
+        } catch (Exception) {
+            // Ignore invalid REMB packets
+        }
+    }
+
+
+    /**
+     * Checks if the next frame should be a keyframe.
+     *
+     * @return bool True if the next frame should be a keyframe
+     */
+    public function isUseKeyframe(): bool
+    {
+        return $this->useKeyframe;
+    }
+
+    /**
+     * Gets the last sender report NTP timestamp.
+     *
+     * @return int|null The NTP timestamp or null if not available
+     */
+    public function getLsr(): ?int
+    {
+        return $this->lsr;
+    }
+
+    /**
+     * Gets the track ID.
+     *
+     * @return string The track ID
+     */
+    public function getTrackId(): string
+    {
+        return $this->trackId;
+    }
+
+    /**
+     * Gets the header extensions map.
+     *
+     * @return HeaderExtensionsMap The header extensions map
+     */
+    public function getHeaderExtensionsMap(): HeaderExtensionsMap
+    {
+        return $this->headerExtensionsMap;
+    }
+
+    /**
+     * Sets the logger instance.
+     *
+     * @param LoggerInterface|null $logger The logger instance
+     */
+    public function setLogger(?LoggerInterface $logger): void
+    {
+        $this->logger = new RtpComponentLogger('RTCRtpSender', $this->kind->value, $logger);
+    }
+
+    /**
+     * Checks if the sender is enabled.
+     *
+     * @return bool True if the sender is enabled
+     */
+    public function isEnabled(): bool
+    {
+        return $this->enabled;
+    }
+
+    /**
+     * Enables or disables (pauses) the sender.
+     *
+     * While disabled the RTP task keeps consuming frames from the track but sends nothing,
+     * effectively pausing the outgoing media. On resume a keyframe is forced so a video
+     * receiver can start decoding again without waiting for the next natural keyframe.
+     *
+     * @param bool $enabled True to resume sending, false to pause
+     */
+    public function setEnabled(bool $enabled): void
+    {
+        if ($enabled === $this->enabled) {
+            return;
+        }
+
+        $this->enabled = $enabled;
+
+        if ($enabled && $this->kind === MediaKind::Video) {
+            $this->sendKeyframe();
+        }
+    }
+
+    /**
+     * Gets the SSRC for RTP packets.
+     *
+     * @return int The SSRC
+     */
+    public function getSsrc(): int
+    {
+        return $this->ssrc;
+    }
+
+    /**
+     * Requests the next frame to be a keyframe.
+     */
+    public function sendKeyframe(): void
+    {
+        $this->useKeyframe = true;
+    }
+
+    /**
+     * Gets the stream ID.
+     *
+     * @return string The stream ID
+     */
+    public function getStreamId(): string
+    {
+        return $this->streamId;
+    }
+
+    /**
+     * Destructor - releases the tasks of the sender when the object is destroyed.
+     *
+     * No BYE is sent: the object being destroyed doesn't mean the stream ended, for example when the
+     * process exits to be restarted, with the session going on in the next one.
+     */
+    public function __destruct()
+    {
+        $this->shutdown(false);
+    }
+
+    /**
+     * Gets the current statistics report.
+     *
+     * @return RTCStatsReport The statistics report
+     */
+    public function getStats(): RTCStatsReport
+    {
+        $this->stats->add(new RTCOutboundRtpStreamStats(
+            id: "outbound_rtp_stream_" . spl_object_id($this),
+            type: StatType::OutboundRtpStream,
+            ssrc: $this->ssrc,
+            kind: $this->kind->value,
+            transportId: $this->transport->getReportTransport()->id,
+            packetsSent: $this->packetCount,
+            bytesSent: $this->octetCount,
+            trackId: $this->trackId
+        ));
+        $this->stats->add($this->transport->getReportTransport());
+
+        return $this->stats;
+    }
+
+    /**
+     * Sets the SSRC for RTP packets.
+     *
+     * @param int $ssrc The SSRC to set
+     */
+    public function setSsrc(int $ssrc): void
+    {
+        $this->ssrc = $ssrc;
+    }
+
+    /**
+     * Sets the SSRC for RTX packets.
+     *
+     * @param int $rtxSsrc The RTX SSRC to set
+     */
+    public function setRtxSsrc(int $rtxSsrc): void
+    {
+        $this->rtxSsrc = $rtxSsrc;
+    }
+
+    /**
+     * Sets the stream ID.
+     *
+     * @param string $streamId The stream ID to set
+     */
+    public function setStreamId(string $streamId): void
+    {
+        $this->streamId = $streamId;
+    }
+
+    /**
+     * Gets the SSRC for RTX packets.
+     *
+     * @return int The RTX SSRC
+     */
+    public function getRtxSsrc(): int
+    {
+        return $this->rtxSsrc;
+    }
+
+    /**
+     * Generates a random sequence number for RTP packets.
+     *
+     * @return int The generated sequence number
+     * @throws RandomException
+     */
+    private function generateSequenceNumber(): int
+    {
+        $bytes = random_bytes(2);
+        $unpacked = unpack('n', $bytes);
+        if ($unpacked === false) {
+            throw new InvalidArgumentException("Failed to unpack sequence number");
+        }
+
+        return (int) $unpacked[1] % 32768;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function __serialize(): array
+    {
+        return SerializableState::export($this, [
+            'rtcpTask' => $this->started && $this->rtcpTask !== '',
+            'encoder' => null,
+        ]);
+    }
+
+    /**
+     * @param array<string, mixed> $data
+     */
+    public function __unserialize(array $data): void
+    {
+        $restartRtcp = false;
+        /**
+         * @var mixed $value
+         */
+        foreach ($data as $key => $value) {
+            if (str_ends_with($key, "\0rtcpTask")) {
+                $restartRtcp = $value === true;
+                $data[$key] = '';
+            }
+            if (str_ends_with($key, "\0encoder")) {
+                unset($data[$key]);
+            }
+        }
+        SerializableState::import($this, $data);
+        $this->rtcpTask = '';
+        $this->encoder = null;
+        if ($restartRtcp) {
+            $this->startRtcpTask();
+        }
+        if ($this->started && $this->track !== null) {
+            EventLoop::queue($this->drainRtp(...));
+        }
+    }
+}
