@@ -36,20 +36,17 @@
 1. پوشه‌ی `vendor` (بدون پکیج‌های توسعه) داخل مخزن است؛ کافی است کل پروژه را آپلود کنید. Composer لازم نیست.
    اگر وابستگی‌ها را عوض کردید: `composer update --no-dev` و دوباره کامیت `vendor` (`config.platform.php` روی 8.2.12 قفل است).
 2. Document Root دامنه را روی پوشه‌ی `public` بگذارید. اگر ممکن نیست، فایل `.htaccess` ریشه‌ی پروژه درخواست‌ها را به `public/` می‌فرستد.
-3. `cp .env.example .env`، مقادیر `APP_URL` و `DB_*` را پر کنید، `APP_DEBUG=false` و `APP_ENV=production`، سپس:
+3. `.env.example` را به `.env` کپی کنید، `APP_URL` و `DB_*` را پر کنید (اگر `APP_KEY` خالی باشد صفحه‌ی اول یک کلید آماده نشان می‌دهد).
+4. آدرس **`/install`** را باز کنید: نسخه‌ی PHP وب و PHP خط فرمانِ هم‌نسخه، اتصال دیتابیس و جدول‌ها را نشان می‌دهد و با دکمه‌ی
+   «ساخت جدول‌های دیتابیس» migrate را داخل همان PHP وب اجرا می‌کند (ترمینال لازم نیست).
+   > روی cPanel دستور ساده‌ی `php` در ترمینال/کران معمولاً نسخه‌ی پیش‌فرض سرور است (مثلاً 7.4)، نه نسخه‌ای که برای دامنه
+   > انتخاب کرده‌اید (مثلاً 8.4)؛ برای همین `php artisan` خطای «You are running 7.4» می‌دهد. همیشه مسیر کامل را بنویسید،
+   > مثل `/opt/cpanel/ea-php84/root/usr/bin/php` یا `/opt/alt/php84/usr/bin/php`. برنامه خودش php هم‌نسخه را پیدا می‌کند
+   > (`App\Support\PhpBinary`) و اگر پیدا نشد عملیات تلگرام را داخل درخواست وب اجرا می‌کند.
+5. پوشه‌های `storage` و `bootstrap/cache` قابل نوشتن باشند و کران‌جاب هر دقیقه را با **همان خطی که صفحه‌ی `/install` نشان می‌دهد** بسازید، مثلاً:
    ```
-   php artisan key:generate
-   php artisan migrate --force
-   php artisan config:cache && php artisan route:cache && php artisan view:cache
+   * * * * * /opt/cpanel/ea-php84/root/usr/bin/php /home/USER/mytelegram/artisan schedule:run >> /dev/null 2>&1
    ```
-   (اگر ترمینال ندارید این دستورها را از بخش «Cron Jobs» یک بار اجرا کنید.)
-4. پوشه‌های `storage` و `bootstrap/cache` قابل نوشتن باشند.
-5. کران‌جاب (هر دقیقه):
-   ```
-   * * * * * /usr/local/bin/php /home/USER/telegram-panel/artisan schedule:run >> /dev/null 2>&1
-   ```
-   مسیر php-cli را از پشتیبانی هاست بپرسید و همان را در `TELEGRAM_PHP_BINARY` هم بگذارید
-   (در درخواست وب `PHP_BINARY` گاهی php-fpm است).
 6. ثبت‌نام کنید، از [my.telegram.org](https://my.telegram.org) ← API development tools یک اپ بسازید و api_id/api_hash را در صفحه‌ی اتصال وارد کنید.
 
 ### تنظیمات `.env`

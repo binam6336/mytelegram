@@ -27,10 +27,10 @@ return Application::configure(basePath: dirname(__DIR__))
             $msg = $e->getMessage();
             if (preg_match('/no such table|Base table or view not found|doesn\'t exist|42S02/i', $msg)) {
                 $title = 'جدول‌های دیتابیس ساخته نشده‌اند';
-                $hint = 'دستور «php artisan migrate --force» را در پوشه‌ی پروژه اجرا کنید (اگر ترمینال ندارید، یک بار از بخش Cron Jobs هاست).';
+                $hint = 'صفحه‌ی '.url('/install').' را باز کنید و دکمه‌ی «ساخت جدول‌های دیتابیس» را بزنید (یا در ترمینال: php artisan migrate --force).';
             } elseif (preg_match('/Access denied|Unknown database|Connection refused|could not find driver|SQLSTATE\[HY000\] \[\d+\]/i', $msg)) {
                 $title = 'اتصال به دیتابیس برقرار نشد';
-                $hint = 'مقادیر DB_HOST، DB_DATABASE، DB_USERNAME و DB_PASSWORD در فایل .env را بررسی کنید (در cPanel نام دیتابیس و کاربر معمولاً پیشوند نام کاربری هاست را دارند) و کاربر را به دیتابیس اضافه کنید.';
+                $hint = 'وضعیت را در '.url('/install').' ببینید. مقادیر DB_HOST، DB_DATABASE، DB_USERNAME و DB_PASSWORD در فایل .env را بررسی کنید (در cPanel نام دیتابیس و کاربر معمولاً پیشوند نام کاربری هاست را دارند) و کاربر را به دیتابیس اضافه کنید.';
             } else {
                 return null;
             }

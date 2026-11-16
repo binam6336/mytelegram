@@ -11,3 +11,4 @@ See README.md for architecture and shared-hosting deployment.
 - Local testing without Telegram: `TELEGRAM_FAKE=true` (code 12345; 22222 → 2FA password `secret`), sqlite, drive with Playwright.
 - Syntax check: `php -l`, `node --check public/js/app.js`.
 - `vendor/` is committed (user request: shared hosting / XAMPP without Composer). It must be the `--no-dev --optimize-autoloader` build, without nested `.git` dirs or symlinks; rebuild and commit it whenever composer.json/lock change.
+- Hosts often have CLI `php` = an old default (7.4) while the site runs 8.x: never spawn plain `php`; use `App\Support\PhpBinary::find()` (same major.minor as web, verified by running it; falls back to inline). Web installer `/install` (`InstallController`) runs pending migrations from the web PHP.

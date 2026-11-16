@@ -4,7 +4,7 @@ namespace App\Services\Telegram;
 
 use App\Models\TelegramAccount;
 use Illuminate\Support\Facades\Log;
-use Symfony\Component\Process\PhpExecutableFinder;
+use App\Support\PhpBinary;
 use Symfony\Component\Process\Process;
 use Throwable;
 
@@ -23,13 +23,15 @@ class TelegramRunner
 
     public function call(TelegramAccount $account, string $action, array $payload = []): array
     {
-        if (config('telegram.mode') === 'inline' || ! function_exists('proc_open')) {
+        // بدون proc_open، یا وقتی php-cli هم‌نسخه‌ی وب پیدا نشد (مثلاً php خط فرمان 7.4 است)،
+        // همان‌جا داخل درخواست وب اجرا می‌شود (باز هم کوتاه و بدون اتصال ماندگار).
+        $php = config('telegram.mode') === 'inline' || ! function_exists('proc_open') ? null : PhpBinary::find();
+        if ($php === null) {
             @set_time_limit((int) config('telegram.process_timeout', 60) + 15);
 
             return $this->service->run($account, $action, $payload);
         }
 
-        $php = config('telegram.php_binary') ?: (new PhpExecutableFinder)->find(false) ?: 'php';
         $process = new Process(
             [$php, base_path('artisan'), 'telegram:exec', (string) $account->id, $action],
             base_path(),

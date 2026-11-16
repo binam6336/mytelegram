@@ -254,3 +254,13 @@ dialog.dlg label { display: flex; flex-direction: column; gap: 6px; margin: 12px
     .otp input { width: 46px !important; height: 54px; }
     .fl-meta { padding-inline-start: 4px; }
 }
+
+/* ---------- install ---------- */
+.checks { list-style: none; padding: 0; margin: 16px 0; display: grid; gap: 8px; }
+.checks li { padding: 10px 14px; border-radius: 12px; font-size: 14px; border-inline-start: 4px solid; }
+.checks li.good { background: #F0FDF4; border-color: var(--green); }
+.checks li.warn { background: #FFFBEB; border-color: #F59E0B; }
+.checks li.bad { background: #FEF2F2; border-color: var(--red); }
+.checks code, .cron { font-family: ui-monospace, Consolas, monospace; font-size: 12px; background: #F1F5F9; padding: 1px 6px; border-radius: 6px; overflow-wrap: anywhere; }
+.checks .err-msg { display: block; color: #991B1B; margin-top: 4px; }
+.cron { display: block; padding: 10px 12px; white-space: pre-wrap; }

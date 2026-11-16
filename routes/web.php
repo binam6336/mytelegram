@@ -3,11 +3,16 @@
 use App\Http\Controllers\AuthController;
 use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\FilterController;
+use App\Http\Controllers\InstallController;
 use App\Http\Controllers\MessageController;
 use App\Http\Controllers\TelegramController;
 use Illuminate\Support\Facades\Route;
 
 Route::redirect('/', '/dashboard');
+
+// نصب از راه مرورگر (بدون نیاز به ترمینال یا php خط فرمان)
+Route::get('/install', [InstallController::class, 'show'])->name('install');
+Route::post('/install/migrate', [InstallController::class, 'migrate'])->middleware('throttle:5,1')->name('install.migrate');
 
 Route::middleware('guest')->group(function () {
     Route::get('/register', [AuthController::class, 'showRegister'])->name('register');
