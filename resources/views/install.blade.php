@@ -24,7 +24,14 @@
         @endif
 
         @if ($proxies)
-            <li class="good"><b>پروکسی تلگرام:</b> <span dir="ltr">{{ implode('، ', $proxies) }}</span></li>
+            @foreach ($proxies as $px)
+                @if ($px['ok'])
+                    <li class="good"><b>پروکسی <span dir="ltr">{{ $px['label'] }}</span>:</b> هاست به آن می‌رسد
+                        (<span dir="ltr">{{ $px['ip'] }}</span>، اتصال TCP در {{ $px['ms'] }}ms). وضعیت نهایی اتصال به تلگرام را چراغ سایدبار پنل نشان می‌دهد.</li>
+                @else
+                    <li class="bad"><b>پروکسی <span dir="ltr">{{ $px['label'] }}</span>:</b> {{ $px['error'] }}</li>
+                @endif
+            @endforeach
         @elseif ($proxy_raw)
             <li class="bad"><b>TELEGRAM_PROXY قابل خواندن نیست.</b> قالب درست: <code dir="ltr">tg://proxy?server=…&amp;port=…&amp;secret=…</code> یا <code dir="ltr">socks5://host:port</code></li>
         @else

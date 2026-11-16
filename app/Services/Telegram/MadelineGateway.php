@@ -378,12 +378,10 @@ class MadelineGateway implements TelegramGateway
             ->setMaxSize(5 * 1024 * 1024);
 
         // پروکسی (هاست‌های داخل ایران) و سقف زمان هر تلاش اتصال
-        $proxies = [];
-        foreach (TelegramProxy::all() as $p) {
-            $proxies[$p['class']][] = $p['extra'];
-        }
         $settings->getConnection()
-            ->setProxies($proxies)
+            ->setProxies(TelegramProxy::forClient())
+            // DNS-over-HTTPS (Cloudflare/Google) از هاست‌های ایران معمولاً در دسترس نیست؛ DNS خود هاست
+            ->setUseDoH((bool) config('telegram.doh', false))
             ->setTimeout((float) config('telegram.connect_timeout', 10));
 
         return $this->apis[$account->id] = new API($account->sessionPath(), $settings);

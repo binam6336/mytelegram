@@ -15,6 +15,9 @@ return [
     */
     'proxy' => env('TELEGRAM_PROXY', ''),
 
+    // DNS-over-HTTPS در MadelineProto (پیش‌فرض خاموش: از هاست‌های داخل ایران معمولاً در دسترس نیست)
+    'doh' => (bool) env('TELEGRAM_DOH', false),
+
     // سقف زمان هر تلاش اتصال به سرور/پروکسی (ثانیه)
     'connect_timeout' => (int) env('TELEGRAM_CONNECT_TIMEOUT', 10),
 

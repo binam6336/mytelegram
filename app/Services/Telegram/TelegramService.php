@@ -6,6 +6,7 @@ use App\Models\Message;
 use App\Models\TelegramAccount;
 use App\Models\TelegramChatCursor;
 use App\Services\KeywordFilter;
+use App\Support\TelegramProxy;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -39,7 +40,7 @@ class TelegramService
                 'verify-password' => $this->verifyPassword($account, (string) ($payload['password'] ?? '')),
                 'sync' => $this->sync($account, (float) ($payload['budget'] ?? config('telegram.sync_budget', 20))),
                 'logout' => $this->logout($account),
-                'ping' => ['ok' => true, 'message' => 'اتصال برقرار است.'] + $this->gateway->ping($account),
+                'ping' => $this->ping($account),
                 default => ['ok' => false, 'message' => 'عملیات ناشناخته'],
             };
         } catch (Throwable $e) {
@@ -174,6 +175,22 @@ class TelegramService
         ];
     }
 
+    private function ping(TelegramAccount $account): array
+    {
+        // با پروکسی: اول بررسی ساده‌ی DNS و TCP، تا اگر هاست به پروکسی نمی‌رسد علت دقیق گفته شود
+        $proxies = TelegramProxy::all();
+        if ($proxies && ! config('telegram.fake')) {
+            $probes = array_map(fn ($p) => TelegramProxy::probe($p), $proxies);
+            $reachable = array_filter($probes, fn ($r) => $r['ok']);
+            if (! $reachable) {
+                return ['ok' => false, 'message' => implode(' | ', array_column($probes, 'error'))];
+            }
+        }
+        $res = $this->gateway->ping($account);
+
+        return ['ok' => true, 'message' => 'اتصال برقرار است.'] + $res;
+    }
+
     private function logout(TelegramAccount $account): array
     {
         $this->gateway->logout($account);
@@ -201,7 +218,7 @@ class TelegramService
             'AUTH_KEY_UNREGISTERED' => 'نشست تلگرام از بین رفته؛ دوباره وارد شوید.',
             'SESSION_REVOKED' => 'نشست از داخل تلگرام بسته شده؛ دوباره وارد شوید.',
             'FLOOD_WAIT' => 'تلگرام موقتاً درخواست‌ها را محدود کرده؛ کمی بعد تلاش کنید.',
-            'SecurityException' => 'اتصال به سرورهای تلگرام برقرار نشد (شاید هاست دسترسی به تلگرام را بسته است).',
+            'SecurityException' => 'هاست به پروکسی وصل شد ولی ارتباط با تلگرام برقرار نشد (secret پروکسی را بررسی کنید یا پروکسی دیگری امتحان کنید).',
             'authorization key' => 'اتصال به سرورهای تلگرام برقرار نشد (شاید هاست دسترسی به تلگرام را بسته است).',
             'Could not connect' => 'اتصال به سرورهای تلگرام برقرار نشد (شاید هاست دسترسی به تلگرام را بسته است).',
         ];
