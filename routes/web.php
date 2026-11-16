@@ -8,7 +8,7 @@ use App\Http\Controllers\MessageController;
 use App\Http\Controllers\TelegramController;
 use Illuminate\Support\Facades\Route;
 
-Route::redirect('/', '/dashboard');
+Route::get('/', fn () => redirect()->route('dashboard'));
 
 // نصب از راه مرورگر (بدون نیاز به ترمینال یا php خط فرمان)
 Route::get('/install', [InstallController::class, 'show'])->name('install');
